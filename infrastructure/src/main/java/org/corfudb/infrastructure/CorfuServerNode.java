@@ -257,7 +257,6 @@ public class CorfuServerNode implements AutoCloseable {
         return new ChannelInitializer() {
             @Override
             protected void initChannel(@Nonnull Channel ch) throws Exception {
-
                 ch.pipeline().addLast(new FlushConsolidationHandler(64, true));
                 // Security variables
                 final SslContext sslContext;

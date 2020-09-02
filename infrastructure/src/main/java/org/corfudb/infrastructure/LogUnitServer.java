@@ -127,7 +127,7 @@ public class LogUnitServer extends AbstractServer {
                     .convertToByteStringRepresentation(config.getMaxCacheSize()));
             streamLog = new InMemoryStreamLog();
         } else {
-            streamLog = new StreamLogFiles(serverContext, config.isNoVerify());
+            streamLog = new StreamLogFiles(serverContext);
         }
 
         dataCache = new LogUnitServerCache(config, streamLog);
@@ -521,7 +521,6 @@ public class LogUnitServer extends AbstractServer {
         private final double cacheSizeHeapRatio;
         private final long maxCacheSize;
         private final boolean memoryMode;
-        private final boolean noVerify;
         private final boolean noSync;
 
         /**
@@ -537,7 +536,6 @@ public class LogUnitServer extends AbstractServer {
                     .cacheSizeHeapRatio(cacheSizeHeapRatio)
                     .maxCacheSize((long) (Runtime.getRuntime().maxMemory() * cacheSizeHeapRatio))
                     .memoryMode(Boolean.valueOf(opts.get("--memory").toString()))
-                    .noVerify((Boolean) opts.get("--no-verify"))
                     .noSync((Boolean) opts.get("--no-sync"))
                     .build();
         }
