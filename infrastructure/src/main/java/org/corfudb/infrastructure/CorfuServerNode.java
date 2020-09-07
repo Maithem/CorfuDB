@@ -13,6 +13,7 @@ import io.netty.channel.ServerChannel;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 import io.netty.handler.codec.LengthFieldPrepender;
+import io.netty.handler.flush.FlushConsolidationHandler;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
 import java.util.Map;
@@ -257,6 +258,7 @@ public class CorfuServerNode implements AutoCloseable {
             @Override
             protected void initChannel(@Nonnull Channel ch) throws Exception {
 
+                ch.pipeline().addLast(new FlushConsolidationHandler(64, true));
                 // Security variables
                 final SslContext sslContext;
                 final String[] enabledTlsProtocols;

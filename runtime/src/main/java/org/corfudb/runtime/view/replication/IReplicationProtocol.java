@@ -1,5 +1,6 @@
 package org.corfudb.runtime.view.replication;
 
+import java.util.concurrent.CompletableFuture;
 import org.corfudb.protocols.wireprotocol.ILogData;
 import org.corfudb.runtime.exceptions.OverwriteException;
 import org.corfudb.runtime.view.RuntimeLayout;
@@ -37,6 +38,10 @@ public interface IReplicationProtocol {
      *                            it was not the result of this call.
      */
     void write(RuntimeLayout runtimeLayout, ILogData data) throws OverwriteException;
+
+    default CompletableFuture<Boolean> asyncWrite(RuntimeLayout runtimeLayout, ILogData data) {
+        throw new UnsupportedOperationException();
+    }
 
     /**
      * Read data from a given address.

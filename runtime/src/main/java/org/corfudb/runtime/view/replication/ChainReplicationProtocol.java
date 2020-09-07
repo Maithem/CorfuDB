@@ -34,11 +34,19 @@ public class ChainReplicationProtocol extends AbstractReplicationProtocol {
         super(holeFillPolicy);
     }
 
+    private final AsyncChainReplicationProtocol async = new AsyncChainReplicationProtocol();
+
+    @Override
+    public CompletableFuture<Boolean> asyncWrite(RuntimeLayout runtimeLayout, ILogData data) {
+        return async.writeAsync(runtimeLayout, data);
+    }
+
     /**
      * {@inheritDoc}
      */
     @Override
     public void write(RuntimeLayout runtimeLayout, ILogData data) throws OverwriteException {
+
         final long globalAddress = data.getGlobalAddress();
         int numUnits = runtimeLayout.getLayout().getSegmentLength(globalAddress);
 
