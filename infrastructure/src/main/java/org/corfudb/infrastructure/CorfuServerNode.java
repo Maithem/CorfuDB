@@ -3,6 +3,7 @@ package org.corfudb.infrastructure;
 import com.google.common.collect.ImmutableMap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.PooledByteBufAllocator;
+import io.netty.channel.AdaptiveRecvByteBufAllocator;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
@@ -231,6 +232,9 @@ public class CorfuServerNode implements AutoCloseable {
                 .childOption(ChannelOption.SO_KEEPALIVE, true)
                 .childOption(ChannelOption.SO_REUSEADDR, true)
                 .childOption(ChannelOption.TCP_NODELAY, true)
+                .childOption(ChannelOption.RCVBUF_ALLOCATOR,
+                        new AdaptiveRecvByteBufAllocator(64 * 1024,
+                                64 * 1024, 1 * 1024 * 1024))
                 .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(
                 384 * 1024, 512 * 1024))
                 .childOption(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT);
