@@ -4,6 +4,7 @@ import com.google.common.collect.ImmutableMap;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.WriteBufferWaterMark;
 import java.lang.Thread.UncaughtExceptionHandler;
 import java.time.Duration;
 import java.util.List;
@@ -150,6 +151,8 @@ public class RuntimeParameters {
                 ImmutableMap.<ChannelOption, Object>builder()
                         .put(ChannelOption.TCP_NODELAY, true)
                         .put(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
+                        .put(ChannelOption.WRITE_BUFFER_WATER_MARK, new WriteBufferWaterMark(
+                        384 * 1024, 512 * 1024))
                         .put(ChannelOption.SO_REUSEADDR, true)
                         .build();
 
