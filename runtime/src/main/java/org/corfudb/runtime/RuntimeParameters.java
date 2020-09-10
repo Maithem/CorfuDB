@@ -1,20 +1,20 @@
 package org.corfudb.runtime;
 
 import com.google.common.collect.ImmutableMap;
+import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
-import lombok.Data;
-import lombok.ToString;
-import org.corfudb.comm.ChannelImplementation;
-import org.corfudb.protocols.wireprotocol.MsgHandlingFilter;
-import org.corfudb.util.MetricsUtils;
-import org.corfudb.runtime.clients.NettyClientRouter;
-
 import java.lang.Thread.UncaughtExceptionHandler;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import lombok.Data;
+import lombok.ToString;
+import org.corfudb.comm.ChannelImplementation;
+import org.corfudb.protocols.wireprotocol.MsgHandlingFilter;
+import org.corfudb.runtime.clients.NettyClientRouter;
+import org.corfudb.util.MetricsUtils;
 
 @Data
 @ToString
@@ -149,6 +149,7 @@ public class RuntimeParameters {
         public static final Map<ChannelOption, Object> DEFAULT_CHANNEL_OPTIONS =
                 ImmutableMap.<ChannelOption, Object>builder()
                         .put(ChannelOption.TCP_NODELAY, true)
+                        .put(ChannelOption.ALLOCATOR, PooledByteBufAllocator.DEFAULT)
                         .put(ChannelOption.SO_REUSEADDR, true)
                         .build();
 
