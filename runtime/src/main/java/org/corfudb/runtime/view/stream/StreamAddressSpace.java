@@ -1,21 +1,19 @@
 package org.corfudb.runtime.view.stream;
 
+import com.google.common.primitives.Longs;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.protocols.wireprotocol.StreamAddressRange;
 import org.corfudb.runtime.view.Address;
 import org.corfudb.util.Utils;
 import org.roaringbitmap.longlong.LongIterator;
-import org.roaringbitmap.longlong.Roaring64NavigableMap;
+import org.roaringbitmap.longlong.Roaring64Bitmap;
 
 import java.io.DataInputStream;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.NavigableSet;
+import java.util.Arrays;
 import java.util.Set;
-import java.util.TreeSet;
+import java.util.function.LongConsumer;
 
 /**
  * This class represents the space of all addresses belonging to a stream.
@@ -36,7 +34,7 @@ final public class StreamAddressSpace {
     private long trimMark;
 
     // Holds the complete map of addresses for this stream.
-    private final Roaring64NavigableMap bitmap;
+    private Roaring64Bitmap bitmap;
 
     /**
      * This constructor is required to facilitate deserialization, keep it private.
@@ -44,20 +42,17 @@ final public class StreamAddressSpace {
      * @param trimMark Stream's trim mark
      * @param bitmap Stream's bitmap
      */
-    private StreamAddressSpace(long trimMark, Roaring64NavigableMap bitmap) {
+    private StreamAddressSpace(long trimMark, Roaring64Bitmap bitmap) {
         this.trimMark = trimMark;
         this.bitmap = bitmap;
-        this.trim(trimMark);
     }
 
     public StreamAddressSpace() {
-        this(Address.NON_ADDRESS, Roaring64NavigableMap.bitmapOf());
+        this(Address.NON_ADDRESS, Roaring64Bitmap.bitmapOf());
     }
 
     public StreamAddressSpace(long trimMark, Set<Long> addresses) {
-        this(trimMark, Roaring64NavigableMap.bitmapOf());
-        addresses.forEach(bitmap::addLong);
-        this.trim(trimMark);
+        this(trimMark, Roaring64Bitmap.bitmapOf(Longs.toArray(addresses)));
     }
 
     public StreamAddressSpace(Set<Long> addresses) {
@@ -84,34 +79,34 @@ final public class StreamAddressSpace {
      * @return returns a as the merged StreamAddressSpace
      */
     public static StreamAddressSpace merge(StreamAddressSpace a, StreamAddressSpace b) {
-        a.mergeFrom(b);
-        return a;
-    }
-
-    // Merge another StreamAddressSpace into this instance
-    private void mergeFrom(StreamAddressSpace other) {
-        this.trimMark = Long.max(trimMark, other.getTrimMark());
-        this.bitmap.or(other.bitmap);
+        long newTrimMark = Long.max(a.getTrimMark(), b.getTrimMark());
+        a.bitmap.or(b.bitmap);
 
         // Because the trim mark can increase after the merge another
         // trim needs to be issued
-        this.trim(this.trimMark);
+        a.trim(newTrimMark);
+        // Since the trim method only sets the trimMark if an address was trimmed, we need to force
+        // the new trim mark for cases where the trim mark increases, but there isn't any addresses
+        // to trim.
+        a.trimMark = newTrimMark;
+        return a;
     }
 
     /**
-     * Copy this stream's addresses to a set, under a given boundary (inclusive).
+     * Call a long consumer on range [trimMark + 1, max].
      *
-     * @param maxGlobal maximum address (inclusive upper bound)
+     * @param max maximum address (inclusive upper bound)
      */
-    public NavigableSet<Long> copyAddressesToSet(final long maxGlobal) {
-        NavigableSet<Long> queue = new TreeSet<>();
-        this.bitmap.forEach(address -> {
-            if (address <= maxGlobal) {
-                queue.add(address);
+    public void forEachUpTo(final long max, LongConsumer consumer) {
+        LongIterator iterator = this.bitmap.getLongIterator();
+        while (iterator.hasNext()) {
+            long current = iterator.next();
+            if (current > trimMark && current <= max) {
+                consumer.accept(current);
+            } else {
+                break;
             }
-        });
-
-        return queue;
+        }
     }
 
     /**
@@ -130,63 +125,92 @@ final public class StreamAddressSpace {
     }
 
     /**
+     * Get the first address in this bitmap.
+     * @return first address in the bitmap if its not empty, otherwise returns the trim mark
+     */
+    private long getFirst() {
+        if (bitmap.isEmpty()) {
+            return trimMark;
+        }
+
+        return bitmap.getLongIterator().next();
+    }
+
+    /**
      * Add an address to this address space.
      *
      * @param address address to add.
      */
     public void addAddress(long address) {
-        //TODO(Maithem): prevent adding an address smaller than the trim mark
+        if (address <= this.trimMark || address < 0) {
+            throw new IllegalArgumentException("Address=" + address + " TrimMark=" + this.trimMark);
+        }
         bitmap.addLong(address);
-    }
-
-    /**
-     * Remove addresses from the stream's address map
-     * and set the new trim mark (to the greatest of all addresses to remove).
-     */
-    private void removeAddresses(List<Long> addresses) {
-        addresses.stream().forEach(bitmap::removeLong);
-
-        // Recover allocated but unused memory
-        bitmap.trim();
-        // TODO(Maithem) if addresses is empty, the trim mark will not be updated
-        trimMark = Collections.max(addresses);
-
-        log.trace("removeAddresses: new trim mark set to {}", trimMark);
     }
 
     /**
      * Trim all addresses lower or equal to trimMark and set new trim mark.
      *
-     * @param trimMark upper limit of addresses to trim
+     * @param newTrimMark upper limit of addresses to trim
      */
-    public void trim(long trimMark) {
-        if (!Address.isAddress(trimMark)) {
+    public void trim(long newTrimMark) {
+        if (!Address.isAddress(newTrimMark)) {
             // If not valid address return and do not attempt to trim.
-            log.warn("trim: attempting to trim non-valid address {}", trimMark);
+            log.warn("trim: attempting to trim non-valid address {}", newTrimMark);
             return;
         }
 
-        // Note: if a negative value is passed to this API the cardinality
-        // of the bitmap is returned, which would be incorrect as we would
-        // be removing all addresses upon an invalid trim mark.
-        long numAddressesToTrim = bitmap.rankLong(trimMark);
-
-        if (numAddressesToTrim <= 0) {
+        // If the new trim mark is greater than the current trim mark it needs to be
+        // updated regardless whether it will result in addresses being removed or not.
+        // For example, the bitmap can be empty, while the trim mark keeps increasing
+        if (newTrimMark <= this.trimMark) {
             return;
         }
 
-        List<Long> addressesToTrim = new ArrayList<>();
-        LongIterator it = bitmap.getLongIterator();
-        for (int i = 0; i < numAddressesToTrim; i++) {
-            addressesToTrim.add(it.next());
+        // At this point point the trim mark is positive and we need to compute
+        // the rank. The rank will indicate how many addresses need to be trimmed
+        long rank = bitmap.rankLong(newTrimMark);
+
+        if (rank <= 0) {
+            return;
         }
 
-        log.trace("trim: Remove {} addresses for trim mark {}", addressesToTrim.size(), trimMark);
+        Roaring64Bitmap trimmedBitmap = new Roaring64Bitmap();
+        LongIterator iterator = this.bitmap.getReverseLongIterator();
+        while (iterator.hasNext()) {
+            long current = iterator.next();
 
-        // Remove and set trim mark
-        if (!addressesToTrim.isEmpty()) {
-            removeAddresses(addressesToTrim);
+            if (current <= newTrimMark) {
+                log.info("trim: stream trim mark moved from {} to {}", this.trimMark, current);
+                this.trimMark = current;
+                break;
+            }
+
+            trimmedBitmap.addLong(current);
         }
+
+        this.bitmap = trimmedBitmap;
+
+        if (log.isTraceEnabled()) {
+            log.trace("trim: trimMark={} streamTrimMark {} size {} addresses={}", newTrimMark,
+                    this.trimMark,
+                    this.bitmap.getLongCardinality(),
+                    this.bitmap.toArray());
+        }
+    }
+
+    /**
+     * Add range helper method that validates the range before adding it
+     * to the bitmap, this is to protect against this bug: https://github.com/RoaringBitmap/RoaringBitmap/pull/445
+     * @param toAdd bitmap to add the range to
+     * @param start start address (inclusive)
+     * @param end end address (exclusive)
+     */
+    private void addRangeHelper(Roaring64Bitmap toAdd, long start, long end) {
+        if (end == 0 || end <= start) {
+            throw new IllegalArgumentException("Invalid range [" + start + "," + end + ")");
+        }
+        toAdd.add(start, end);
     }
 
     /**
@@ -194,16 +218,42 @@ final public class StreamAddressSpace {
      *
      * @return Bitmap with addresses in this range.
      */
-    public StreamAddressSpace getAddressesInRange(StreamAddressRange range) {
-        Roaring64NavigableMap addressesInRange = new Roaring64NavigableMap();
+    public StreamAddressSpace getAddressesInRange2(StreamAddressRange range) {
+        Roaring64Bitmap addressesInRange = new Roaring64Bitmap();
         if (range.getStart() > range.getEnd()) {
             bitmap.forEach(address -> {
-                // Because our search is referenced to the stream's tail => (end < start]
                 if (address > range.getEnd() && address <= range.getStart()) {
                     addressesInRange.add(address);
                 }
             });
         }
+        StreamAddressSpace ret = new StreamAddressSpace(this.trimMark, addressesInRange);
+        StreamAddressSpace other = getAddressesInRange(range);
+
+        if (ret.getTrimMark() != other.getTrimMark() && !Arrays.equals(ret.toArray(), other.toArray())) {
+            throw new AssertionError();
+        }
+        return ret;
+    }
+    public StreamAddressSpace getAddressesInRange(StreamAddressRange range) {
+        Roaring64Bitmap addressesInRange = new Roaring64Bitmap();
+
+        if (range.getStart() <= range.getEnd()) {
+            throw new IllegalArgumentException("Invalid range (" + range.getEnd() + ", " + range.getStart() + "]");
+        }
+
+        long first = getFirst();
+        long last = getTail();
+
+        if (this.bitmap.isEmpty() || range.getEnd() >= last || range.getStart() < first) {
+            // Return empty address space if the range doesn't intersect, or if the bitmap is empty
+            return  new StreamAddressSpace(this.trimMark, addressesInRange);
+        }
+
+        long leftEndpoint = Math.max(first, range.getEnd() + 1);
+        long rightEndpoint = Math.min(last, range.getStart());
+        addRangeHelper(addressesInRange, leftEndpoint, rightEndpoint + 1);
+        addressesInRange.and(this.bitmap);
 
         if (log.isTraceEnabled()) {
             log.trace("getAddressesInRange[{}]: address map in range [{}-{}] has a total of {} addresses.",
@@ -216,6 +266,8 @@ final public class StreamAddressSpace {
 
     public void setTrimMark(long trimMark) {
         this.trimMark = trimMark;
+        // TODO(Maithem): This method should be removed. When the trimMark is set here, then trim is called
+        // the trim call will return without trimming.
     }
 
     public long getTrimMark() {
@@ -226,6 +278,9 @@ final public class StreamAddressSpace {
      * Select the n - 1 largest element in this address space.
      */
     public long select(long n) {
+        if (n < 0) {
+            throw new IllegalArgumentException("n=" + n + " size=" +  bitmap.getLongCardinality());
+        }
         return bitmap.select(n);
     }
 
@@ -247,14 +302,25 @@ final public class StreamAddressSpace {
         return copy;
     }
 
+    /**
+     * Serialize this StreamAddressSpace into DataOutput
+     * @param out DataOutput to serialize to
+     * @throws IOException
+     */
     public void serialize(DataOutput out) throws IOException {
         out.writeLong(trimMark);
         bitmap.serialize(out);
     }
 
+    /**
+     * Deserialize: create a new StreamAddressSpace from DataInputStream
+     * @param in input stream to read from
+     * @return StreamAddressSpace
+     * @throws IOException
+     */
     public static StreamAddressSpace deserialize(DataInputStream in) throws IOException {
         long trimMark = in.readLong();
-        Roaring64NavigableMap map = new Roaring64NavigableMap();
+        Roaring64Bitmap map = new Roaring64Bitmap();
         map.deserialize(in);
         return new StreamAddressSpace(trimMark, map);
     }
@@ -290,8 +356,8 @@ final public class StreamAddressSpace {
         long first = Address.NON_EXIST;
         long last = Address.NON_EXIST;
         if (!bitmap.isEmpty()) {
-            first = bitmap.iterator().next();
-            last =bitmap.getReverseLongIterator().next();
+            first = getFirst();
+            last = getTail();
         }
         return String.format("[%s, %s]@%s size %s", first, last, trimMark, this.size());
     }
