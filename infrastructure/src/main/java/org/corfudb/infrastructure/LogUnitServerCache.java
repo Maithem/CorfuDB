@@ -83,7 +83,7 @@ public class LogUnitServerCache {
                 "This may impact the server performance", MAX_STREAM_THRESHOLD);
         }
 
-        long result = Math.addExact(logData.getSizeEstimate(), (Memory.sizeOf.deepSizeOf(logData.getMetadataMap())));
+        long result = Math.addExact(logData.getSizeEstimate(), (logData.getMetadataMap().size() * Long.BYTES * 2));
         return toIntExact(Math.addExact(result, KEY_SIZE));
     }
 
