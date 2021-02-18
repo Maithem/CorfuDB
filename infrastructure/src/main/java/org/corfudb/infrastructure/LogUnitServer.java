@@ -296,10 +296,10 @@ public class LogUnitServer extends AbstractServer {
 
         final RequestMsg batchProcessorReq = req;
         batchWriter.addTask(BatchWriterOperation.Type.WRITE, batchProcessorReq)
-                .thenRunAsync(() -> {
+                .thenRun(() -> {
                     dataCache.put(logData.getGlobalAddress(), logData);
                     router.sendResponse(getResponseMsg(batchProcessorReq.getHeader(), getWriteLogResponseMsg()), ctx);
-                }, executor)
+                })
                 .exceptionally(ex -> {
                     handleException(ex, ctx, batchProcessorReq, router);
                     return null;
