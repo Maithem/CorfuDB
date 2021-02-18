@@ -19,9 +19,13 @@ import java.util.stream.IntStream;
 import lombok.extern.slf4j.Slf4j;
 import org.HdrHistogram.Histogram;
 import org.HdrHistogram.Recorder;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.core.LifeCycle;
+import org.apache.logging.log4j.core.LoggerContext;
 import org.corfudb.perf.SimulatorArguments;
 import org.corfudb.perf.Utils;
 import org.corfudb.runtime.CorfuRuntime;
+import org.slf4j.LoggerFactory;
 
 /**
  * Sample usage: java -jar target/streaming-sim.jar --duration 1 --endpoint localhost:9000
@@ -221,6 +225,12 @@ public class StreamingSimulator {
                   reportHistogram =
                       Producer.cumulativeRecorder.getIntervalHistogram(reportHistogram);
                   printStats(System.nanoTime() - startTsNs, reportHistogram);
+
+                  //LoggerContext loggerContext = (LoggerContext) LoggerFactory.getILoggerFactory();
+                  //loggerContext.stop();
+                  LogManager.shutdown();
+                  //((LifeCycle) LogManager.getContext()).stop();
+                  //  org.apache.logging.slf4j.Log4jLoggerFactory cannot be cast to org.apache.logging.log4j.core.LoggerContext
                 }));
 
     final long startTime = System.currentTimeMillis();

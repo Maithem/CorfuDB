@@ -242,6 +242,18 @@ final public class StreamAddressSpace {
             throw new IllegalArgumentException("Invalid range (" + range.getEnd() + ", " + range.getStart() + "]");
         }
 
+        LongIterator iter = this.bitmap.getReverseLongIterator();
+        while (iter.hasNext()) {
+            long curr = iter.next();
+            // (end, start]
+            if (curr <= range.getEnd()) {
+                break;
+            } else if (curr <= range.getStart()) {
+                addressesInRange.addLong(curr);
+            }
+        }
+
+        /**
         long first = getFirst();
         long last = getTail();
 
@@ -255,6 +267,7 @@ final public class StreamAddressSpace {
         addRangeHelper(addressesInRange, leftEndpoint, rightEndpoint + 1);
         addressesInRange.and(this.bitmap);
 
+         **/
         if (log.isTraceEnabled()) {
             log.trace("getAddressesInRange[{}]: address map in range [{}-{}] has a total of {} addresses.",
                     Utils.toReadableId(range.getStreamID()), range.getEnd(),
