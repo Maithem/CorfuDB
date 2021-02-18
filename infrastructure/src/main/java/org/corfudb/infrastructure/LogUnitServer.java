@@ -156,7 +156,12 @@ public class LogUnitServer extends AbstractServer {
 
     @Override
     protected void processRequest(RequestMsg req, ChannelHandlerContext ctx, IServerRouter router) {
-        executor.submit(() -> getHandlerMethods().handle(req, ctx, router));
+        if (req.getPayload().getPayloadCase().equals(PayloadCase.WRITE_LOG_REQUEST)) {
+            // Execute this type of request on the IO thread
+            getHandlerMethods().handle(req, ctx, router);
+        } else {
+            executor.submit(() -> getHandlerMethods().handle(req, ctx, router));
+        }
     }
 
     /**
