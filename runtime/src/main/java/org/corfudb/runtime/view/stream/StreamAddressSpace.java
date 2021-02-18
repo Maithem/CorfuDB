@@ -6,7 +6,7 @@ import org.corfudb.protocols.wireprotocol.StreamAddressRange;
 import org.corfudb.runtime.view.Address;
 import org.corfudb.util.Utils;
 import org.roaringbitmap.longlong.LongIterator;
-import org.roaringbitmap.longlong.Roaring64Bitmap;
+import org.roaringbitmap.longlong.Roaring64NavigableMap;
 
 import java.io.DataInputStream;
 import java.io.DataOutput;
@@ -34,7 +34,7 @@ final public class StreamAddressSpace {
     private long trimMark;
 
     // Holds the complete map of addresses for this stream.
-    private Roaring64Bitmap bitmap;
+    private Roaring64NavigableMap bitmap;
 
     /**
      * This constructor is required to facilitate deserialization, keep it private.
@@ -42,17 +42,17 @@ final public class StreamAddressSpace {
      * @param trimMark Stream's trim mark
      * @param bitmap Stream's bitmap
      */
-    private StreamAddressSpace(long trimMark, Roaring64Bitmap bitmap) {
+    private StreamAddressSpace(long trimMark, Roaring64NavigableMap bitmap) {
         this.trimMark = trimMark;
         this.bitmap = bitmap;
     }
 
     public StreamAddressSpace() {
-        this(Address.NON_ADDRESS, Roaring64Bitmap.bitmapOf());
+        this(Address.NON_ADDRESS, Roaring64NavigableMap.bitmapOf());
     }
 
     public StreamAddressSpace(long trimMark, Set<Long> addresses) {
-        this(trimMark, Roaring64Bitmap.bitmapOf(Longs.toArray(addresses)));
+        this(trimMark, Roaring64NavigableMap.bitmapOf(Longs.toArray(addresses)));
     }
 
     public StreamAddressSpace(Set<Long> addresses) {
@@ -175,7 +175,7 @@ final public class StreamAddressSpace {
             return;
         }
 
-        Roaring64Bitmap trimmedBitmap = new Roaring64Bitmap();
+        Roaring64NavigableMap trimmedBitmap = new Roaring64NavigableMap();
         LongIterator iterator = this.bitmap.getReverseLongIterator();
         while (iterator.hasNext()) {
             long current = iterator.next();
@@ -206,12 +206,6 @@ final public class StreamAddressSpace {
      * @param start start address (inclusive)
      * @param end end address (exclusive)
      */
-    private void addRangeHelper(Roaring64Bitmap toAdd, long start, long end) {
-        if (end == 0 || end <= start) {
-            throw new IllegalArgumentException("Invalid range [" + start + "," + end + ")");
-        }
-        toAdd.add(start, end);
-    }
 
     /**
      * Get addresses in range (end, start], where start > end.
@@ -219,7 +213,7 @@ final public class StreamAddressSpace {
      * @return Bitmap with addresses in this range.
      */
     public StreamAddressSpace getAddressesInRange2(StreamAddressRange range) {
-        Roaring64Bitmap addressesInRange = new Roaring64Bitmap();
+        Roaring64NavigableMap addressesInRange = new Roaring64NavigableMap();
         if (range.getStart() > range.getEnd()) {
             bitmap.forEach(address -> {
                 if (address > range.getEnd() && address <= range.getStart()) {
@@ -236,7 +230,7 @@ final public class StreamAddressSpace {
         return ret;
     }
     public StreamAddressSpace getAddressesInRange(StreamAddressRange range) {
-        Roaring64Bitmap addressesInRange = new Roaring64Bitmap();
+        Roaring64NavigableMap addressesInRange = new Roaring64NavigableMap();
 
         if (range.getStart() <= range.getEnd()) {
             throw new IllegalArgumentException("Invalid range (" + range.getEnd() + ", " + range.getStart() + "]");
@@ -333,7 +327,7 @@ final public class StreamAddressSpace {
      */
     public static StreamAddressSpace deserialize(DataInputStream in) throws IOException {
         long trimMark = in.readLong();
-        Roaring64Bitmap map = new Roaring64Bitmap();
+        Roaring64NavigableMap map = new Roaring64NavigableMap();
         map.deserialize(in);
         return new StreamAddressSpace(trimMark, map);
     }
