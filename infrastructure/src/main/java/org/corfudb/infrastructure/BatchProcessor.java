@@ -17,6 +17,7 @@ import org.corfudb.runtime.exceptions.WrongEpochException;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.jctools.queues.MpscBlockingConsumerArrayQueue;
 
 import javax.annotation.Nonnull;
 import java.util.ArrayList;
@@ -71,7 +72,7 @@ public class BatchProcessor implements AutoCloseable {
         this.streamLog = streamLog;
 
         BATCH_SIZE = 50;
-        operationsQueue = new LinkedBlockingQueue<>();
+        operationsQueue = new MpscBlockingConsumerArrayQueue(1_000);
         writeRecordTimer = MeterRegistryProvider.getInstance().map(registry ->
                 Timer.builder("logunit.write.timer")
                         .publishPercentiles(0.50, 0.95, 0.99)
