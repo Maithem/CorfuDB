@@ -21,6 +21,8 @@
         <module>test</module>
         <module>it</module>
         <module>utils</module>
+        <module>agent</module>
+        <module>AgentTester</module>
     </modules>
 
     <packaging>pom</packaging>
