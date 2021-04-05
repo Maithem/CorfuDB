@@ -12,6 +12,8 @@ import java.io.StringWriter;
 import java.lang.instrument.Instrumentation;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 
 import static net.bytebuddy.implementation.bytecode.assign.Assigner.Typing.DYNAMIC;
 import static net.bytebuddy.matcher.ElementMatchers.is;
@@ -24,7 +26,8 @@ public class Agent {
         final File tempFolder;
 
         try {
-            tempFolder= Files.createTempDirectory("agent-bootstrap").toFile();
+            Path tmp = Paths.get("/tmp");
+            tempFolder= Files.createTempDirectory(tmp, "agent-bootstrap").toFile();
         } catch (Exception e) {
             System.err.println("[Agent] Cannot create temp folder for bootstrap class instrumentation");
             e.printStackTrace(System.err);
