@@ -1,13 +1,17 @@
 package org.corfudb.protocols.wireprotocol;
 
 import com.google.protobuf.TextFormat;
+import io.micrometer.core.instrument.Timer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufOutputStream;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToByteEncoder;
 import java.io.IOException;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.LongAccumulator;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 
@@ -20,8 +24,12 @@ import static org.corfudb.protocols.CorfuProtocolCommon.MessageMarker.PROTO_RESP
 @Slf4j
 public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
 
+    private static final Optional<Timer> encoder = MeterRegistryProvider.getInstance().map(registry ->
+                        io.micrometer.core.instrument.Timer.builder("NettyCorfuMessageEncoder.latency")
+                                .publishPercentiles(0.50, 0.95, 0.99)
+                                .publishPercentileHistogram(true)
+                                .register(registry));
 
-    final LongAccumulator maxValue = new LongAccumulator(Math::max, Long.MIN_VALUE);
 
     /**
      * Encodes an outbound corfu message into a ByteBuf. The corfu message is either
@@ -33,6 +41,7 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
      */
     @Override
     protected void encode(ChannelHandlerContext channelHandlerContext, Object object, ByteBuf byteBuf) {
+        long ts = System.nanoTime();
         try {
             if (object instanceof RequestMsg) {
                 RequestMsg request = (RequestMsg) object;
@@ -65,15 +74,8 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
                 log.error("encode: Unknown object of class - {} received while encoding", object.getClass());
             }
 
-            if (log.isDebugEnabled()) {
-                long prev = maxValue.get();
-                maxValue.accumulate(byteBuf.readableBytes());
-                long curr = maxValue.get();
-                // The max value has been updated.
-                if (prev < curr) {
-                    log.debug("encode: New max write buffer found {}", curr);
-                }
-            }
+            encoder.ifPresent(x -> x.record(System.nanoTime() - ts, TimeUnit.NANOSECONDS));
+
         } catch (Exception e) {
             log.error("encode: Error during serialization!", e);
         }

@@ -1,5 +1,6 @@
 package org.corfudb.protocols.wireprotocol;
 
+import io.micrometer.core.instrument.Timer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufInputStream;
 import io.netty.buffer.Unpooled;
@@ -8,7 +9,11 @@ import io.netty.handler.codec.ByteToMessageDecoder;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
+import java.util.concurrent.TimeUnit;
+
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.protocols.CorfuProtocolCommon.MessageMarker;
 import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
 import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
@@ -18,7 +23,11 @@ import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
  */
 @Slf4j
 public class NettyCorfuMessageDecoder extends ByteToMessageDecoder {
-
+    private static final Optional<Timer> decoder = MeterRegistryProvider.getInstance().map(registry ->
+            io.micrometer.core.instrument.Timer.builder("NettyCorfuMessageDecoder.latency")
+                    .publishPercentiles(0.50, 0.95, 0.99)
+                    .publishPercentileHistogram(true)
+                    .register(registry));
     /**
      * Decodes an inbound corfu message from a ByteBuf. The corfu message is either
      * legacy (of type CorfuMsg) or Protobuf (of type RequestMsg/ResponseMsg).
@@ -32,6 +41,7 @@ public class NettyCorfuMessageDecoder extends ByteToMessageDecoder {
     protected void decode(ChannelHandlerContext channelHandlerContext, ByteBuf byteBuf,
                           List<Object> list) throws Exception {
         // Check the type of message based on first byte
+        long ts = System.nanoTime();
         byte msgMark = byteBuf.readByte();
 
         switch (MessageMarker.typeMap.get(msgMark)) {
@@ -62,6 +72,8 @@ public class NettyCorfuMessageDecoder extends ByteToMessageDecoder {
             default:
                 throw new IllegalStateException("decode: Received an incorrectly marked message.");
         }
+
+        decoder.ifPresent(x -> x.record(System.nanoTime() - ts, TimeUnit.NANOSECONDS));
     }
 
     @Override
