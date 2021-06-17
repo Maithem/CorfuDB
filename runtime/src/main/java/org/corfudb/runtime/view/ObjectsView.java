@@ -26,6 +26,7 @@ import javax.annotation.Nonnull;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 
 /**
  * A view of the objects inside a Corfu instance.
@@ -147,8 +148,9 @@ public class ObjectsView extends AbstractView {
         }
 
         // Continue with ending the transaction if the context is not null
-        long totalTime = System.currentTimeMillis() - context.getStartTime();
-        log.trace("TXEnd[{}] time={} ms", context, totalTime);
+        log.trace("TXEnd[{}] time={} us", context,  TimeUnit.MICROSECONDS
+                .convert(System.nanoTime() -  context.getStartTime(),
+                TimeUnit.NANOSECONDS));
 
         try {
             return TransactionalContext.getCurrentContext().commitTransaction();

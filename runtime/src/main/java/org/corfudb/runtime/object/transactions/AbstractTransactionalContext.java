@@ -1,11 +1,13 @@
 package org.corfudb.runtime.object.transactions;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 import javax.annotation.Nullable;
 import lombok.Getter;
 import lombok.Setter;
@@ -155,7 +157,7 @@ public abstract class AbstractTransactionalContext implements
     AbstractTransactionalContext(Transaction transaction) {
         transactionID = Utils.genPseudorandomUUID();
         this.transaction = transaction;
-        this.startTime = System.currentTimeMillis();
+        this.startTime = System.nanoTime();
         this.parentContext = TransactionalContext.getCurrentContext();
         AbstractTransactionalContext.log.debug("TXBegin[{}]", this);
     }
@@ -312,12 +314,15 @@ public abstract class AbstractTransactionalContext implements
         } else {
             // Otherwise, fetch a read token from the sequencer the linearize
             // ourselves against.
+            long ts1 = System.nanoTime();
             Token timestamp = getTransaction()
                     .getRuntime()
                     .getSequencerView()
                     .query()
                     .getToken();
-            log.trace("obtainSnapshotTimestamp: sequencer SnapshotTimestamp[{}] {}", this, timestamp);
+            log.trace("obtainSnapshotTimestamp: sequencer SnapshotTimestamp[{}] {} in {} us", this, timestamp,
+                    TimeUnit.MICROSECONDS.convert(System.nanoTime() - ts1, TimeUnit.NANOSECONDS));
+
             return timestamp;
         }
     }

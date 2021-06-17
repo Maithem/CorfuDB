@@ -23,6 +23,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 /**
@@ -152,9 +153,14 @@ public class StreamsView extends AbstractView {
 
             for (int retry = 0; retry < runtime.getParameters().getWriteRetry(); retry++) {
                 // Go to the sequencer, grab a token to write.
+                long ts = System.nanoTime();
                 tokenResponse = conflictInfo == null
                         ? runtime.getSequencerView().next(streamIDs) // Token w/o conflict info
                         : runtime.getSequencerView().next(conflictInfo, streamIDs); // Token w/ conflict info
+
+                log.trace("resolution time={} us", TimeUnit.MICROSECONDS
+                        .convert(System.nanoTime() -  ts,
+                                TimeUnit.NANOSECONDS));
 
                 // Is our token a valid type?
                 AbortCause abortCause = getAbortCauseFromToken(tokenResponse);
@@ -171,7 +177,11 @@ public class StreamsView extends AbstractView {
                     // Run pre-commit listeners if we are in transaction.
                     runPreCommitListeners(tokenResponse, ld, serializeMetadata);
                     // Attempt to write to the log.
+                    long wts1 = System.nanoTime();
                     runtime.getAddressSpaceView().write(tokenResponse, ld, cacheOption);
+                    log.trace("write time={} us", TimeUnit.MICROSECONDS
+                            .convert(System.nanoTime() -  wts1,
+                                    TimeUnit.NANOSECONDS));
                     // If we're here, we succeeded, return the acquired token.
                     return tokenResponse.getSequence();
                 } catch (OverwriteException oe) {
