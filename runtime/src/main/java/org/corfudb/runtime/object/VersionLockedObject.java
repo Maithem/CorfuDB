@@ -572,9 +572,8 @@ public class VersionLockedObject<T extends ICorfuSMR<T>> {
      * @param entry The entry to apply.
      */
     private Object applyUpdateUnsafe(SMREntry entry, long timestamp) {
-        log.trace("Apply[{}] of {}@{} ({})", this, entry.getSMRMethod(),
-                Address.isAddress(entry.getGlobalAddress()) ? entry.getGlobalAddress() : "OPT",
-                entry.getSMRArguments());
+        log.trace("Apply[{}] of {}@{}", this, entry.getSMRMethod(),
+                Address.isAddress(entry.getGlobalAddress()) ? entry.getGlobalAddress() : "OPT");
 
         ICorfuSMRUpcallTarget<T> target = upcallTargetMap.get(entry.getSMRMethod());
         if (target == null) {

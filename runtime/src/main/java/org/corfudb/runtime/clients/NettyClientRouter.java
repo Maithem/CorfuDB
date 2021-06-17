@@ -590,8 +590,7 @@ public class NettyClientRouter extends SimpleChannelInboundHandler<Object> imple
                     if (validateClientId(responseMsg.getHeader().getClientId())) {
                         // Route the message to the handler.
                         if (log.isTraceEnabled()) {
-                            log.trace("Message routed to {}: {}",
-                                    handler.getClass().getSimpleName(), TextFormat.shortDebugString(responseMsg));
+                            log.trace("Message routed to {}", handler.getClass().getSimpleName());
                         }
                         handler.handleMessage(responseMsg, ctx);
                     }

@@ -170,9 +170,8 @@ public class OptimisticTransactionalContext extends AbstractTransactionalContext
     public <T extends ICorfuSMR<T>> long logUpdate(ICorfuSMRProxyInternal<T> proxy,
                                                    SMREntry updateEntry,
                                                    Object[] conflictObjects) {
-        log.trace("LogUpdate[{},{}] {} ({}) conflictObj={}",
-                this, proxy, updateEntry.getSMRMethod(),
-                updateEntry.getSMRArguments(), conflictObjects);
+        log.trace("LogUpdate[{},{}] {} conflictObj={}",
+                this, proxy, updateEntry.getSMRMethod(), conflictObjects);
 
         return addToWriteSet(proxy, updateEntry, conflictObjects);
     }

@@ -432,7 +432,7 @@ public abstract class AbstractQueuedStreamView extends
                 maxGlobal, context.getGlobalPointer(), context.maxResolution, context.minResolution);
         log.trace("Fill_Read_Queue[{}]: addresses in this stream Resolved queue {}" +
                         " - ReadQueue {} - CP Queue {}", this,
-                context.resolvedQueue, context.readQueue, context.readCpQueue);
+                context.resolvedQueue.size(), context.readQueue.size(), context.readCpQueue.size());
 
         // If the stream has just been reset and we don't have
         // any checkpoint entries, we should consult

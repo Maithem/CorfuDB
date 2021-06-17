@@ -78,7 +78,7 @@ public class TransactionalContext {
         log.debug("New TransactionalContext created: [{}]", context);
         getTransactionStack().addFirst(context);
         // For debugging transaction already started issues, store the call stack trace.
-        context.setBeginTxnStackTrace(Thread.currentThread().getStackTrace());
+        //context.setBeginTxnStackTrace(Thread.currentThread().getStackTrace());
         return context;
     }
 
