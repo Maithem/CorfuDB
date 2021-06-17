@@ -1,6 +1,10 @@
 package org.corfudb.protocols.wireprotocol;
 
+import com.google.common.collect.ImmutableList;
+import com.google.common.util.concurrent.AtomicDouble;
 import com.google.protobuf.TextFormat;
+import io.micrometer.core.instrument.DistributionSummary;
+import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Timer;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufOutputStream;
@@ -30,6 +34,11 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
                                 .publishPercentileHistogram(true)
                                 .register(registry));
 
+    private static final Optional<DistributionSummary> writeDistributionSummary = MeterRegistryProvider
+            .getInstance()
+            .map(registry -> DistributionSummary.builder("encodesizes")
+                    .baseUnit("bytes").register(registry));
+
 
     /**
      * Encodes an outbound corfu message into a ByteBuf. The corfu message is either
@@ -45,12 +54,14 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
         try {
             if (object instanceof RequestMsg) {
                 RequestMsg request = (RequestMsg) object;
+                long start = byteBuf.writerIndex();
                 try (ByteBufOutputStream requestOutputStream = new ByteBufOutputStream(byteBuf)) {
                     try {
                         // Marks the Corfu msg as a protobuf request.
                         requestOutputStream.writeByte(PROTO_REQUEST_MSG_MARK.asByte());
                         requestOutputStream.writeLong(System.nanoTime());
                         request.writeTo(requestOutputStream);
+                        writeDistributionSummary.ifPresent(x -> x.record(byteBuf.writerIndex() - start));
                     } catch (IOException e) {
                         log.warn("encode[{}]: Exception occurred when encoding request {}, caused by {}",
                                 request.getHeader().getRequestId(), TextFormat.shortDebugString(request.getHeader()),
