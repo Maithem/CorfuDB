@@ -28,6 +28,12 @@ public class NettyCorfuMessageDecoder extends ByteToMessageDecoder {
                     .publishPercentiles(0.50, 0.95, 0.99)
                     .publishPercentileHistogram(true)
                     .register(registry));
+
+    private static final Optional<Timer> propegation = MeterRegistryProvider.getInstance().map(registry ->
+            io.micrometer.core.instrument.Timer.builder("propegation.latency")
+                    .publishPercentiles(0.50, 0.95, 0.99)
+                    .publishPercentileHistogram(true)
+                    .register(registry));
     /**
      * Decodes an inbound corfu message from a ByteBuf. The corfu message is either
      * legacy (of type CorfuMsg) or Protobuf (of type RequestMsg/ResponseMsg).
@@ -43,6 +49,9 @@ public class NettyCorfuMessageDecoder extends ByteToMessageDecoder {
         // Check the type of message based on first byte
         long ts = System.nanoTime();
         byte msgMark = byteBuf.readByte();
+        long timestamp = byteBuf.readLong();
+
+        propegation.ifPresent(x -> x.record(System.nanoTime() - timestamp, TimeUnit.NANOSECONDS));
 
         switch (MessageMarker.typeMap.get(msgMark)) {
             case PROTO_REQUEST_MSG_MARK:

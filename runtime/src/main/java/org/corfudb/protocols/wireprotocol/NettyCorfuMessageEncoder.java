@@ -49,6 +49,7 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
                     try {
                         // Marks the Corfu msg as a protobuf request.
                         requestOutputStream.writeByte(PROTO_REQUEST_MSG_MARK.asByte());
+                        requestOutputStream.writeLong(System.nanoTime());
                         request.writeTo(requestOutputStream);
                     } catch (IOException e) {
                         log.warn("encode[{}]: Exception occurred when encoding request {}, caused by {}",
@@ -63,6 +64,7 @@ public class NettyCorfuMessageEncoder extends MessageToByteEncoder<Object> {
                     try {
                         // Marks the Corfu msg as protobuf response.
                         responseOutputStream.writeByte(PROTO_RESPONSE_MSG_MARK.asByte());
+                        responseOutputStream.writeLong(System.nanoTime());
                         response.writeTo(responseOutputStream);
                     } catch (IOException e) {
                         log.warn("encode[{}]: Exception occurred when encoding response {}, caused by {}",
