@@ -1,9 +1,9 @@
 pipeline {
   agent any
   stages {
-    stage('') {
+    stage('mvn build') {
       steps {
-        build 'build-corfu'
+        build 'mvn clean install -DskipTests -T4'
       }
     }
 
