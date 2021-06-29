@@ -22,6 +22,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.NavigableSet;
 import java.util.Set;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -192,46 +193,64 @@ public class AddressSpaceView extends AbstractView {
             ld = new LogData(DataType.DATA, data, runtime.getParameters().getCodecType());
         }
 
-        layoutHelper(e -> {
-            Layout l = e.getLayout();
-            // Check if the token issued is in the same
-            // epoch as the layout we are about to write
-            // to.
-            if (token.getEpoch() != l.getEpoch()) {
-                throw new StaleTokenException(l.getEpoch());
-            }
+    layoutHelper(
+        e -> {
+          Layout l = e.getLayout();
+          // Check if the token issued is in the same
+          // epoch as the layout we are about to write
+          // to.
+          if (token.getEpoch() != l.getEpoch()) {
+            throw new StaleTokenException(l.getEpoch());
+          }
 
-            // Set the data to use the token
-            ld.useToken(token);
-            ld.setId(runtime.getParameters().getClientId());
+          // Set the data to use the token
+          ld.useToken(token);
+          ld.setId(runtime.getParameters().getClientId());
 
-            // Do the write
+          // Do the write
+
+          try {
             try {
-                l.getReplicationMode(token.getSequence())
-                        .getReplicationProtocol(runtime)
-                        .write(e, ld);
-            } catch (OverwriteException ex) {
-                if (ex.getOverWriteCause() == OverwriteCause.SAME_DATA) {
-                    // If we have an overwrite exception with the SAME_DATA cause, it means that the
-                    // server suspects our data has already been written, in this case we need to
-                    // validate the state of the write.
-                    validateStateOfWrittenEntry(token.getSequence(), ld);
-                } else {
-                    // If we have an Overwrite exception with a different cause than SAME_DATA
-                    // we do not need to validate the state of the write, as we know we have been
-                    // certainly overwritten either by other data, by a hole or the address was trimmed.
-                    // Large writes are also rejected right away.
-                    throw ex;
-                }
-            } catch (WriteSizeException | QuotaExceededException ie) {
-                log.warn("write: write failed", ie);
-                throw ie;
-            } catch (RuntimeException re) {
-                log.error("write: Got exception during replication protocol write with token: {}", token, re);
-                validateStateOfWrittenEntry(token.getSequence(), ld);
+               //l.getReplicationMode(token.getSequence())
+                 //   .getReplicationProtocol(runtime)
+                  //.write(e, ld);
+
+              l.getReplicationMode(token.getSequence())
+                  .getReplicationProtocol(runtime)
+                  .asyncWrite(e, ld)
+                  .join();
+
+            } catch (CompletionException ce) {
+              if (!(ce.getCause() instanceof RuntimeException)) {
+                throw new RuntimeException(ce.getCause());
+              }
+
+              throw (RuntimeException) ce.getCause();
             }
-            return null;
-        }, true);
+          } catch (OverwriteException ex) {
+            if (ex.getOverWriteCause() == OverwriteCause.SAME_DATA) {
+              // If we have an overwrite exception with the SAME_DATA cause, it means that the
+              // server suspects our data has already been written, in this case we need to
+              // validate the state of the write.
+              validateStateOfWrittenEntry(token.getSequence(), ld);
+            } else {
+              // If we have an Overwrite exception with a different cause than SAME_DATA
+              // we do not need to validate the state of the write, as we know we have been
+              // certainly overwritten either by other data, by a hole or the address was trimmed.
+              // Large writes are also rejected right away.
+              throw ex;
+            }
+          } catch (WriteSizeException | QuotaExceededException ie) {
+            log.warn("write: write failed", ie);
+            throw ie;
+          } catch (RuntimeException re) {
+            log.error(
+                "write: Got exception during replication protocol write with token: {}", token, re);
+            validateStateOfWrittenEntry(token.getSequence(), ld);
+          }
+          return null;
+        },
+        true);
 
         // Cache the successful write
         if (cacheOption == CacheOption.WRITE_THROUGH) {

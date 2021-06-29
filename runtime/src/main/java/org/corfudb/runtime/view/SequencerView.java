@@ -3,6 +3,7 @@ package org.corfudb.runtime.view;
 import com.codahale.metrics.MetricRegistry;
 import com.codahale.metrics.Timer;
 import com.google.common.collect.Lists;
+import java.util.concurrent.CompletableFuture;
 import org.corfudb.protocols.wireprotocol.StreamAddressRange;
 import org.corfudb.runtime.view.stream.StreamAddressSpace;
 import org.corfudb.protocols.wireprotocol.StreamsAddressResponse;
@@ -102,6 +103,13 @@ public class SequencerView extends AbstractView {
         try (Timer.Context context = MetricsUtils.getConditionalContext(sequencerNextOneStream)) {
             return layoutHelper(e -> CFUtils.getUninterruptibly(e.getPrimarySequencerClient()
                     .nextToken(Arrays.asList(streamIds), 1)));
+        }
+    }
+
+    public CompletableFuture<TokenResponse> nextAsync(UUID ... streamIds) {
+        try (Timer.Context context = MetricsUtils.getConditionalContext(sequencerNextOneStream)) {
+            return layoutHelper(e -> e.getPrimarySequencerClient()
+                    .nextToken(Arrays.asList(streamIds), 1));
         }
     }
 
