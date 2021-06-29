@@ -4,11 +4,8 @@ import com.google.common.collect.ImmutableMap;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import org.corfudb.comm.ChannelImplementation;
-import org.corfudb.protocols.wireprotocol.MsgHandlingFilter;
-import org.corfudb.util.MetricsUtils;
 
 import java.time.Duration;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -40,13 +37,10 @@ public class RuntimeParametersBuilder {
                     .build();
     protected Map<ChannelOption, Object> customNettyChannelOptions = DEFAULT_CHANNEL_OPTIONS;
     protected Thread.UncaughtExceptionHandler uncaughtExceptionHandler;
-    protected List<MsgHandlingFilter> nettyClientInboundMsgFilters = null;
     protected volatile Runnable systemDownHandler = () -> {
         };
     protected volatile Runnable beforeRpcHandler = () -> {
         };
-    protected int prometheusMetricsPort = MetricsUtils.NO_METRICS_PORT;
-
     public RuntimeParametersBuilder tlsEnabled(boolean tlsEnabled) {
         this.tlsEnabled = tlsEnabled;
         return this;
@@ -157,16 +151,6 @@ public class RuntimeParametersBuilder {
         return this;
     }
 
-    public RuntimeParametersBuilder nettyClientInboundMsgFilters(List<MsgHandlingFilter> nettyClientInboundMsgFilters) {
-        this.nettyClientInboundMsgFilters = nettyClientInboundMsgFilters;
-        return this;
-    }
-
-    public RuntimeParametersBuilder prometheusMetricsPort(int prometheusMetricsPort) {
-        this.prometheusMetricsPort = prometheusMetricsPort;
-        return this;
-    }
-
     public RuntimeParametersBuilder systemDownHandler(Runnable systemDownHandler) {
         this.systemDownHandler = systemDownHandler;
         return this;
@@ -201,8 +185,6 @@ public class RuntimeParametersBuilder {
         runtimeParameters.setShutdownNettyEventLoop(shutdownNettyEventLoop);
         runtimeParameters.setCustomNettyChannelOptions(customNettyChannelOptions);
         runtimeParameters.setUncaughtExceptionHandler(uncaughtExceptionHandler);
-        runtimeParameters.setNettyClientInboundMsgFilters(nettyClientInboundMsgFilters);
-        runtimeParameters.setPrometheusMetricsPort(prometheusMetricsPort);
         runtimeParameters.setSystemDownHandler(systemDownHandler);
         runtimeParameters.setBeforeRpcHandler(beforeRpcHandler);
         return runtimeParameters;

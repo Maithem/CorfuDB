@@ -1,11 +1,17 @@
 package org.corfudb.infrastructure;
 
 import io.netty.channel.ChannelHandlerContext;
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
-
 import java.util.concurrent.atomic.AtomicReference;
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
+import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
+import org.corfudb.runtime.proto.service.CorfuMessage.HeaderMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
+
+import static org.corfudb.protocols.CorfuProtocolServerErrors.getNotReadyErrorMsg;
+import static org.corfudb.protocols.service.CorfuProtocolMessage.getHeaderMsg;
+import static org.corfudb.protocols.service.CorfuProtocolMessage.getResponseMsg;
 
 /**
  * Created by mwei on 12/4/15.
@@ -19,11 +25,11 @@ public abstract class AbstractServer {
     private final AtomicReference<ServerState> state = new AtomicReference<>(ServerState.READY);
 
     /**
-     * Get the message handler for this instance.
+     * Get the request handlers for this instance.
      *
-     * @return A message handler.
+     * @return The request handler methods.
      */
-    public abstract HandlerMethods getHandler();
+    public abstract RequestHandlerMethods getHandlerMethods();
 
     /**
      * Seal the server with the epoch.
@@ -34,58 +40,49 @@ public abstract class AbstractServer {
         // Overridden in log unit to flush operations stamped with an old epoch
     }
 
-    public abstract boolean isServerReadyToHandleMsg(CorfuMsg msg);
+    /**
+     * Determine if the server is ready to handle a request.
+     * @param request The incoming request message.
+     * @return True if the server is ready to handle this request, and false otherwise.
+     */
+    public boolean isServerReadyToHandleMsg(RequestMsg request) {
+        return getState() == ServerState.READY;
+    }
 
     /**
      * A stub that handlers can override to manage their threading, otherwise
      * the requests will be executed on the IO threads
-     * @param msg
-     * @param ctx
-     * @param r
-     */
-    protected void processRequest(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
-        getHandler().handle(msg, ctx, r);
-    }
-
-    /**
-     * Handle a incoming Netty message.
-     *
-     * @param msg An incoming message.
+     * @param req An incoming request message.
      * @param ctx The channel handler context.
-     * @param r   The router that took in the message.
+     * @param r The router that took in the request.
      */
-    public final void handleMessage(CorfuMsg msg, ChannelHandlerContext ctx, IServerRouter r) {
-        if (getState() == ServerState.SHUTDOWN) {
-            log.warn("Server received {} but is already shutdown.", msg.getMsgType().toString());
-            return;
-        }
-
-        if (!isServerReadyToHandleMsg(msg)) {
-            r.sendResponse(ctx, msg, CorfuMsgType.NOT_READY.msg());
-            return;
-        }
-
-        processRequest(msg, ctx, r);
-    }
+    protected abstract void processRequest(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r);
 
     /**
-     * Handle an incoming message (not Netty specific).
+     * Handle a incoming request message.
      *
-     * @param msg An incoming message.
-     * @param r   The router that took in the message.
+     * @param req An incoming request message.
+     * @param ctx The channel handler context.
+     * @param r   The router that took in the request message.
      */
-    public final void handleMessage(CorfuMsg msg, IServerRouter r) {
+    public final void handleMessage(RequestMsg req, ChannelHandlerContext ctx, IServerRouter r) {
         if (getState() == ServerState.SHUTDOWN) {
-            log.warn("Server received {} but is already shutdown.", msg.getMsgType().toString());
+            log.warn("handleMessage[{}]: Server received {} but is already shutdown.",
+                    req.getHeader().getRequestId(), req.getPayload().getPayloadCase());
             return;
         }
 
-        if (!isServerReadyToHandleMsg(msg)) {
-            r.sendResponse(msg, CorfuMsgType.NOT_READY.msg());
+        if (!isServerReadyToHandleMsg(req)) {
+            r.sendResponse(getNotReadyError(req.getHeader()), ctx);
             return;
         }
 
-        processRequest(msg, null, r);
+        processRequest(req, ctx, r);
+    }
+
+    private ResponseMsg getNotReadyError(HeaderMsg requestHeader) {
+        HeaderMsg responseHeader = getHeaderMsg(requestHeader, ClusterIdCheck.CHECK, EpochCheck.IGNORE);
+        return getResponseMsg(responseHeader, getNotReadyErrorMsg());
     }
 
     protected void setState(ServerState newState) {

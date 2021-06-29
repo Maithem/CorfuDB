@@ -17,6 +17,8 @@ import java.util.Queue;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
+
+import com.google.protobuf.ByteString;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.common.compression.Codec;
 import org.corfudb.common.util.ObservableValue;
@@ -42,8 +44,8 @@ import org.corfudb.infrastructure.logreplication.replication.send.logreader.LogE
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.SnapshotReader;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.StreamsSnapshotReader;
 import org.corfudb.protocols.wireprotocol.TokenResponse;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
 import org.corfudb.runtime.collections.CorfuTable;
 import org.corfudb.runtime.view.AbstractViewTest;
 import org.junit.After;
@@ -250,7 +252,7 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
 
         // Block until the snapshot sync completes and next transition occurs.
         // The transition should happen to IN_LOG_ENTRY_SYNC state.
-        Queue<LogReplicationEntry> listenerQueue = ((TestDataSender) dataSender).getEntryQueue();
+        Queue<LogReplicationEntryMsg> listenerQueue = ((TestDataSender) dataSender).getEntryQueue();
 
         while(!fsm.getState().getType().equals(LogReplicationStateType.WAIT_SNAPSHOT_APPLY)) {
             transitionAvailable.acquire();
@@ -264,8 +266,8 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
         assertThat(listenerQueue.size()).isEqualTo(NUM_ENTRIES);
 
         for (int i = 0; i < NUM_ENTRIES; i++) {
-            assertThat(listenerQueue.poll().getPayload())
-                    .isEqualTo( String.format(PAYLOAD_FORMAT, i).getBytes());
+            assertThat(listenerQueue.poll().getData())
+                    .isEqualTo(ByteString.copyFrom(String.format(PAYLOAD_FORMAT, i).getBytes()));
         }
     }
 
@@ -341,7 +343,7 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
 
         assertThat(fsm.getState().getType()).isEqualTo(LogReplicationStateType.WAIT_SNAPSHOT_APPLY);
 
-        Queue<LogReplicationEntry> listenerQueue = ((TestDataSender) dataSender).getEntryQueue();
+        Queue<LogReplicationEntryMsg> listenerQueue = ((TestDataSender) dataSender).getEntryQueue();
 
         assertThat(listenerQueue.size()).isEqualTo(NUM_ENTRIES);
 
@@ -351,8 +353,8 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
         assertThat(fsm.getState().getType()).isEqualTo(LogReplicationStateType.IN_LOG_ENTRY_SYNC);
 
         for (int i=0; i<NUM_ENTRIES; i++) {
-            assertThat(listenerQueue.poll().getPayload())
-                    .isEqualTo( String.format(PAYLOAD_FORMAT, i).getBytes());
+            assertThat(listenerQueue.poll().getData())
+                    .isEqualTo(ByteString.copyFrom(String.format(PAYLOAD_FORMAT, i).getBytes()));
         }
     }
 
@@ -506,6 +508,7 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
                 LogReplicationClusterInfo.ClusterRole.ACTIVE, CORFU_PORT),
                 Executors.newSingleThreadExecutor(new ThreadFactoryBuilder().setNameFormat("fsm-worker").build()),
                 ackReader);
+        ackReader.startAckReader(fsm.getLogEntryReader());
         transitionObservable = fsm.getNumTransitions();
         transitionObservable.addObserver(this);
 
@@ -548,7 +551,7 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
         // Wait until the expected state
         while (waitUntilExpected) {
             if (fsm.getState().getType() == expectedState) {
-                return event.getEventID();
+                return event.getEventId();
             } else {
                 transitionAvailable.acquire();
             }
@@ -556,7 +559,7 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
 
         assertThat(fsm.getState().getType()).isEqualTo(expectedState);
 
-        return event.getEventID();
+        return event.getEventId();
     }
 
     /**
@@ -586,19 +589,17 @@ public class LogReplicationFSMTest extends AbstractViewTest implements Observer 
      */
     @Override
     public void update(Observable obs, Object arg) {
-        if (obs == transitionObservable)
-        {
+        if (obs.equals(transitionObservable)) {
             while (!transitionAvailable.hasQueuedThreads()) {
                 // Wait until some thread is waiting to acquire...
             }
             transitionAvailable.release();
             // log.debug("Transition::#"  + transitionObservable.getValue() + "::" + fsm.getState().getType());
-        } else if (obs == snapshotMessageCounterObservable) {
-            if (limitSnapshotMessages == snapshotMessageCounterObservable.getValue() && observeSnapshotSync) {
-                // If number of messages in snapshot reaches the expected value force termination of SNAPSHOT_SYNC
-                // log.debug("Insert event: " + LogReplicationEventType.REPLICATION_STOP);
-                fsm.input(new LogReplicationEvent(LogReplicationEventType.REPLICATION_STOP));
-            }
+        } else if (obs.equals(snapshotMessageCounterObservable) &&
+                limitSnapshotMessages == snapshotMessageCounterObservable.getValue() && observeSnapshotSync) {
+            // If number of messages in snapshot reaches the expected value force termination of SNAPSHOT_SYNC
+            // log.debug("Insert event: " + LogReplicationEventType.REPLICATION_STOP);
+            fsm.input(new LogReplicationEvent(LogReplicationEventType.REPLICATION_STOP));
         }
     }
 

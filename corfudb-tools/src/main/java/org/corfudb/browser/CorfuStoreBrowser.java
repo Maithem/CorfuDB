@@ -3,24 +3,44 @@ package org.corfudb.browser;
 import com.google.common.collect.Iterables;
 import com.google.common.reflect.TypeToken;
 
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
+import com.google.protobuf.InvalidProtocolBufferException;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.runtime.CorfuOptions;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.CorfuStoreMetadata;
 import org.corfudb.runtime.CorfuStoreMetadata.TableName;
-import org.corfudb.runtime.collections.CorfuStore;
+import org.corfudb.runtime.ExampleSchemas.ExampleTableName;
+import org.corfudb.runtime.ExampleSchemas.ManagedMetadata;
+import org.corfudb.runtime.collections.CorfuRecord;
+import org.corfudb.runtime.collections.CorfuStoreShim;
+import org.corfudb.runtime.collections.CorfuStreamEntries;
 import org.corfudb.runtime.collections.CorfuTable;
 import org.corfudb.runtime.collections.CorfuDynamicKey;
 import org.corfudb.runtime.collections.CorfuDynamicRecord;
 import org.corfudb.runtime.collections.PersistedStreamingMap;
+import org.corfudb.runtime.collections.StreamListener;
 import org.corfudb.runtime.collections.StreamingMap;
+import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
-import org.corfudb.runtime.collections.TxBuilder;
+import org.corfudb.runtime.collections.ManagedTxnContext;
 import org.corfudb.runtime.object.ICorfuVersionPolicy;
 import org.corfudb.runtime.view.SMRObject;
 import org.corfudb.runtime.view.TableRegistry;
@@ -28,6 +48,10 @@ import org.corfudb.util.serializer.DynamicProtobufSerializer;
 import org.corfudb.util.serializer.ISerializer;
 import org.corfudb.util.serializer.Serializers;
 import org.rocksdb.Options;
+
+import com.google.protobuf.util.JsonFormat;
+
+import javax.annotation.Nonnull;
 
 /**
  * This is the CorfuStore Browser Tool which prints data in a given namespace and table.
@@ -133,11 +157,20 @@ public class CorfuStoreBrowser {
                 Iterables.partition(entryStream::iterator, batchSize);
         for (List<Map.Entry<CorfuDynamicKey, CorfuDynamicRecord>> partition : partitions) {
             for (Map.Entry<CorfuDynamicKey, CorfuDynamicRecord> entry : partition) {
-                builder = new StringBuilder("\nKey:\n" + entry.getKey().getKey())
-                        .append("\nPayload:\n").append(entry.getValue().getPayload())
-                        .append("\nMetadata:\n").append(entry.getValue().getMetadata())
-                        .append("\n====================\n");
-                log.info(builder.toString());
+                try {
+                    builder = new StringBuilder("\nKey:\n")
+                            .append(JsonFormat.printer().print(entry.getKey().getKey()))
+                            .append("\nPayload:\n")
+                            .append(entry.getValue() != null && entry.getValue().getPayload() != null ?
+                                    JsonFormat.printer().print(entry.getValue().getPayload())   : "")
+                            .append("\nMetadata:\n")
+                            .append(entry.getValue() != null && entry.getValue().getMetadata() != null ?
+                                    JsonFormat.printer().print(entry.getValue().getMetadata()): "")
+                            .append("\n====================\n");
+                    log.info(builder.toString());
+                } catch (InvalidProtocolBufferException e) {
+                    log.error("invalid protobuf: ", e);
+                }
             }
         }
         return size;
@@ -209,40 +242,258 @@ public class CorfuStoreBrowser {
      * @param tablename - table name without the namespace
      * @param numItems - total number of items to load
      * @param batchSize - number of items in each transaction
+     * @param itemSize - size of each item - a random string array
      * @return - number of entries in the table
      */
-    public int loadTable(String namespace, String tablename, int numItems, int batchSize) {
+    public int loadTable(String namespace, String tablename, int numItems, int batchSize, int itemSize) {
         verifyNamespaceAndTablename(namespace, tablename);
-        CorfuStore store = new CorfuStore(runtime);
+        CorfuStoreShim store = new CorfuStoreShim(runtime);
         try {
             TableOptions.TableOptionsBuilder<Object, Object> optionsBuilder = TableOptions.builder();
             if (diskPath != null) {
                 optionsBuilder.persistentDataPath(Paths.get(diskPath));
             }
-            store.openTable(namespace, tablename,
-                    TableName.getDefaultInstance().getClass(),
-                    TableName.getDefaultInstance().getClass(),
-                    TableName.getDefaultInstance().getClass(),
+            final Table<ExampleTableName, ExampleTableName, ManagedMetadata> table = store.openTable(
+                    namespace, tablename,
+                    ExampleTableName.class,
+                    ExampleTableName.class,
+                    ManagedMetadata.class,
                     optionsBuilder.build());
 
-            TableName dummyVal = TableName.newBuilder().setNamespace(namespace).setTableName(tablename).build();
-            log.info("Loading {} items in {} batchSized transactions into {}${}",
-                    numItems, batchSize, namespace, tablename);
+            byte[] array = new byte[itemSize];
+
+            /*
+             * Random bytes are needed to bypass the compression.
+             * If we don't use random bytes, compression will reduce the size of the payload siginficantly
+             * increasing the time it takes to load data if we are trying to fill up disk.
+             */
+            new Random().nextBytes(array);
+            ExampleTableName dummyVal = ExampleTableName.newBuilder().setNamespace(namespace+tablename)
+                    .setTableName(new String(array, StandardCharsets.UTF_16)).build();
+            log.info("WARNING: Loading {} items of {} size in {} batchSized transactions into {}${}",
+                    numItems, itemSize, batchSize, namespace, tablename);
             int itemsRemaining = numItems;
             while (itemsRemaining > 0) {
-                log.info("loadTable: Items left {}", itemsRemaining);
-                TxBuilder tx = store.tx(namespace);
+                ManagedTxnContext tx = store.tx(namespace);
                 for (int j = batchSize; j > 0 && itemsRemaining > 0; j--, itemsRemaining--) {
-                    TableName dummyKey = TableName.newBuilder()
+                    ExampleTableName dummyKey = ExampleTableName.newBuilder()
                             .setNamespace(Integer.toString(itemsRemaining))
                             .setTableName(Integer.toString(j)).build();
-                    tx.update(tablename, dummyKey, dummyVal, dummyVal);
+                    tx.putRecord(table, dummyKey, dummyVal, ManagedMetadata.getDefaultInstance());
                 }
-                tx.commit();
+                long address = tx.commit();
+                log.info("loadTable: Txn at address {}. Items  now left {}", address,
+                        itemsRemaining);
             }
         } catch (Exception e) {
             log.error("loadTable: {} {} {} {} failed.", namespace, tablename, numItems, batchSize, e);
         }
         return (int)(Math.ceil((double)numItems/batchSize));
+    }
+
+    /**
+     * Subscribe to and just dump the updates read from a table
+     * @param namespace namespace to listen on
+     * @param tableName tableName to subscribe to
+     * @param stopAfter number of updates to stop listening at
+     * @return number of updates read so far
+     */
+    public long listenOnTable(String namespace, String tableName, int stopAfter) {
+        verifyNamespaceAndTablename(namespace, tableName);
+        CorfuStoreShim store = new CorfuStoreShim(runtime);
+        final Table<ExampleTableName, ExampleTableName, ManagedMetadata> table;
+        try {
+            TableOptions.TableOptionsBuilder<Object, Object> optionsBuilder = TableOptions.builder();
+            if (diskPath != null) {
+                optionsBuilder.persistentDataPath(Paths.get(diskPath));
+            }
+            table = store.openTable(
+                    namespace, tableName,
+                    ExampleTableName.class,
+                    ExampleTableName.class,
+                    ManagedMetadata.class,
+                    optionsBuilder.build());
+        } catch (Exception ex) {
+            log.error("Unable to open table " + namespace + "$" + tableName);
+            throw new RuntimeException("Unable to open table.");
+        }
+
+        int tableSize = table.count();
+        log.info("Listening to updates on Table {} in namespace {} with size {} ID {}...",
+                tableName, namespace, tableSize, table.getStreamUUID().toString());
+
+        class StreamDumper implements StreamListener {
+            @Getter
+            AtomicLong txnRead;
+
+            @Getter
+            volatile boolean isError;
+
+            public StreamDumper() {
+                this.txnRead = new AtomicLong(0);
+            }
+
+            @Override
+            public void onNext(CorfuStreamEntries results) {
+                log.info("onNext invoked with {}. Read so far {}", results.getEntries().size(),
+                        txnRead.get());
+                results.getEntries().forEach((schema, entries) -> {
+                    if (!schema.getTableName().equals(tableName)) {
+                        log.warn("Not my table {}", schema);
+                        return;
+                    }
+                    entries.forEach(entry -> {
+                        try {
+                            String builder = "\nKey:\n" +
+                                    JsonFormat.printer().print(entry.getKey()) +
+                                    "\nPayload:\n" +
+                                    (entry.getPayload() != null ?
+                                            JsonFormat.printer().print(entry.getPayload()) : "") +
+                                    "\nMetadata:\n" +
+                                    (entry.getMetadata() != null ?
+                                            JsonFormat.printer().print(entry.getMetadata()) : "") +
+                                    "\nOperation:\n" +
+                                    entry.getOperation().toString() +
+                                    "\n====================\n"+
+                                    "\n====================\n";
+                            log.info(builder);
+                            long now = System.currentTimeMillis();
+                            long recordInsertedAt = ((ManagedMetadata)entry.getMetadata()).getLastModifiedTime();
+                            log.info("\n Time since insert: "+(now - recordInsertedAt)+"ms\n");
+                            txnRead.incrementAndGet();
+                        } catch (InvalidProtocolBufferException e) {
+                            log.error("invalid protobuf: ", e);
+                        }
+                    });
+                });
+            }
+
+            @Override
+            public void onError(Throwable throwable) {
+                isError = true;
+                log.error("Subscriber hit error", throwable);
+            }
+        }
+
+        StreamDumper streamDumper = new StreamDumper();
+        List<String> tablesOfInterest = Collections.singletonList(tableName);
+        String streamTag = ExampleTableName.getDescriptor().getOptions()
+                .getExtension(CorfuOptions.tableSchema).getStreamTag(0);
+        store.subscribeListener(streamDumper, namespace, streamTag, tablesOfInterest, null);
+        while (streamDumper.getTxnRead().get() < stopAfter || streamDumper.isError()) {
+            final int SLEEP_DURATION_MILLIS = 100;
+            try {
+                TimeUnit.MILLISECONDS.sleep(SLEEP_DURATION_MILLIS);
+            } catch (InterruptedException e) {
+                log.error("listenOnTable: Interrupted while sleeping", e);
+            }
+        }
+
+        store.unsubscribeListener(streamDumper);
+
+        return streamDumper.getTxnRead().get();
+    }
+
+    /**
+     * List all stream tags present in the Registry.
+     *
+     * @return stream tags
+     * */
+    public Set<String> listStreamTags() {
+        Set<String> streamTags = new HashSet<>();
+        runtime.getTableRegistry().getRegistryTable().values().forEach(record ->
+                streamTags.addAll(record.getMetadata().getTableOptions().getStreamTagList()));
+
+        log.info("\n======================\n");
+        log.info("Total unique stream tags: [{}]", streamTags.size());
+        streamTags.forEach(log::info);
+        log.info("\n======================\n");
+
+        return streamTags;
+    }
+
+    /**
+     * List a map of stream tags to table names.
+     *
+     * @return map of tags to table names in the registry
+     */
+    public Map<String, List<TableName>> listTagToTableMap() {
+        Map<String, List<TableName>> streamTagToTableNames = getTagToTableNamesMap();
+        log.info("\n======================\n");
+        log.info("Total unique stream tags: [{}]", streamTagToTableNames.keySet().size());
+        log.info("Stream tags: {}\n", streamTagToTableNames.keySet());
+        streamTagToTableNames.forEach(this::printStreamTagMap);
+        log.info("\n======================\n");
+        return streamTagToTableNames;
+    }
+
+    /**
+     * List all tags for the given table.
+     *
+     * @param namespace namespace for the table of interest
+     * @param table table name of interest
+     */
+    public Set<String> listTagsForTable(String namespace, String table) {
+        verifyNamespaceAndTablename(namespace, table);
+        Set<String> tags = new HashSet<>();
+        TableName tableName = TableName.newBuilder().setNamespace(namespace).setTableName(table).build();
+        CorfuRecord<CorfuStoreMetadata.TableDescriptors, CorfuStoreMetadata.TableMetadata> record = runtime.getTableRegistry()
+                .getRegistryTable().get(tableName);
+        if (record != null) {
+            tags.addAll(record.getMetadata().getTableOptions().getStreamTagList());
+            log.info("\n======================\n");
+            log.info("table: <{}${}> --- Tags[total={}] :: {}", namespace, table, tags.size(), tags);
+            log.info("\n======================\n");
+        } else {
+            log.warn("Invalid namespace {} and table name {}. Review or run operation --listTagsMap" +
+                    " for complete map (all tables).", namespace, tableName);
+        }
+
+        return tags;
+    }
+
+    /**
+     * List all tables with a specific stream tag.
+     *
+     * @param streamTag specific stream tag, if empty or null return all stream tags map
+     * @return table names with given 'streamTag'
+     */
+    public List<TableName> listTablesForTag(@Nonnull String streamTag) {
+        if (streamTag == null || streamTag.isEmpty()) {
+            log.warn("Stream tag is null or empty. Provide correct --tag <tag> argument.");
+            return Collections.EMPTY_LIST;
+        }
+
+        Map<String, List<TableName>> streamTagToTableNames = getTagToTableNamesMap();
+        log.info("\n======================\n");
+        printStreamTagMap(streamTag, streamTagToTableNames.get(streamTag));
+        log.info("\n======================\n");
+        return streamTagToTableNames.get(streamTag);
+    }
+
+    private Map<String, List<TableName>> getTagToTableNamesMap() {
+        Map<String, List<TableName>> streamTagToTableNames = new HashMap<>();
+        runtime.getTableRegistry().getRegistryTable().forEach((tableName, schema) ->
+                schema.getMetadata().getTableOptions().getStreamTagList().forEach(tag -> {
+                    if (streamTagToTableNames.putIfAbsent(tag, new ArrayList<>(Arrays.asList(tableName))) != null) {
+                        streamTagToTableNames.computeIfPresent(tag, (key, tableList) -> {
+                            tableList.add(tableName);
+                            return tableList;
+                        });
+                    }
+                })
+        );
+
+        return streamTagToTableNames;
+    }
+
+    private void printStreamTagMap(String tag, List<TableName> tables) {
+        String formatMapping = "";
+        for (TableName tName : tables) {
+            formatMapping += String.format("<%s$%s>, ", tName.getNamespace(), tName.getTableName());
+        }
+        // Remove last continuation characters for a clean output ', '
+        formatMapping = formatMapping.substring(0, formatMapping.length() - 2);
+        log.info("tag: <'{}'> --- Tables[total={}] :: {{}}", tag, tables.size(), formatMapping);
     }
 }

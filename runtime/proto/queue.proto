@@ -1,8 +1,17 @@
-syntax = "proto2";
+syntax = "proto3";
 
+package org.corfudb.runtime;
 option java_package = "org.corfudb.runtime";
 
 message CorfuQueueIdMsg {
-    optional int64 txSequence = 1;
-    optional int64 entryId = 2;
+    int64 txSequence = 1;
+    int64 entryId = 2;
+}
+
+message CorfuGuidMsg {
+    int64 instanceId = 1;
+}
+
+message CorfuQueueMetadataMsg {
+    int64 txSequence = 1;
 }

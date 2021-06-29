@@ -42,7 +42,8 @@ import org.junit.Test;
 /**
  * Created by maithem on 11/2/16.
  */
-public class StreamLogFilesTest extends AbstractCorfuTest {
+public class
+StreamLogFilesTest extends AbstractCorfuTest {
 
     private String getDirPath() {
         return PARAMETERS.TEST_TEMP_DIR;
@@ -389,37 +390,6 @@ public class StreamLogFilesTest extends AbstractCorfuTest {
 
         assertThatThrownBy(() -> new StreamLogFiles(getContext(), false))
                 .isInstanceOf(DataCorruptionException.class);
-    }
-
-    @Test
-    public void multiThreadedReadWrite() throws Exception {
-        String logDir = getDirPath();
-        StreamLog log = new StreamLogFiles(getContext(), false);
-
-        ByteBuf b = Unpooled.buffer();
-        byte[] streamEntry = "Payload".getBytes();
-        Serializers.CORFU.serialize(streamEntry, b);
-
-        final int num_threads = PARAMETERS.CONCURRENCY_SOME;
-        final int num_entries = PARAMETERS.NUM_ITERATIONS_LOW;
-
-        scheduleConcurrently(num_threads, threadNumber -> {
-            int base = threadNumber * num_entries;
-            for (int i = base; i < base + num_entries; i++) {
-                long address = (long) i;
-                log.append(address, new LogData(DataType.DATA, b));
-            }
-        });
-
-        executeScheduled(num_threads, PARAMETERS.TIMEOUT_LONG);
-
-        // verify that addresses 0 to 2000 have been used up
-        for (int x = 0; x < num_entries * num_threads; x++) {
-            long address = (long) x;
-            LogData data = log.read(address);
-            byte[] bytes = (byte[]) data.getPayload(null);
-            assertThat(bytes).isEqualTo(streamEntry);
-        }
     }
 
     @Test

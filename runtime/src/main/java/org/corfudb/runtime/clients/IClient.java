@@ -1,12 +1,12 @@
 package org.corfudb.runtime.clients;
 
 import io.netty.channel.ChannelHandlerContext;
-
 import java.util.Set;
 
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
-import org.corfudb.protocols.wireprotocol.PriorityLevel;
+import org.corfudb.runtime.proto.ServerErrors.ServerErrorMsg.ErrorCase;
+import org.corfudb.runtime.proto.service.CorfuMessage.PriorityLevel;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponsePayloadMsg.PayloadCase;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 
 /**
  * This is an interface which all clients to a ClientRouter must implement.
@@ -34,27 +34,34 @@ public interface IClient {
      */
     IClientRouter getRouter();
 
-    default ClientMsgHandler getMsgHandler() {
-        throw new UnsupportedOperationException("Message handler not provided, "
-                + "please override handleMessage!");
+    /**
+     * @return The Response handler used by the Netty Client.
+     */
+    default ClientResponseHandler getResponseHandler() {
+        throw new UnsupportedOperationException("Response handler not provided, "
+                + "please override handleMessage");
     }
 
     /**
-     * Handle a incoming message on the channel.
+     * Handle a incoming response on the channel.
      *
-     * @param msg The incoming message
-     * @param ctx The channel handler context
+     * @param msg The incoming response.
+     * @param ctx The channel handler context.
      */
-    default void handleMessage(CorfuMsg msg, ChannelHandlerContext ctx) {
-        getMsgHandler().handle(msg, ctx);
+    default void handleMessage(ResponseMsg msg, ChannelHandlerContext ctx) {
+        getResponseHandler().handle(msg, ctx);
     }
 
     /**
-     * Returns a set of message types that the client handles.
+     * Returns a set of payload cases that the client handles.
      *
-     * @return The set of message types this client handles.
+     * @return The set of payload cases this client handles.
      */
-    default Set<CorfuMsgType> getHandledTypes() {
-        return getMsgHandler().getHandledTypes();
+    default Set<PayloadCase> getHandledCases() {
+        return getResponseHandler().getHandledCases();
+    }
+
+    default Set<ErrorCase> getHandledErrors() {
+        return getResponseHandler().getHandledErrors();
     }
 }

@@ -1,5 +1,15 @@
 package org.corfudb.infrastructure;
 
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+
+import com.google.common.collect.Sets;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import org.assertj.core.api.Assertions;
 import org.corfudb.AbstractCorfuTest;
 import org.corfudb.runtime.exceptions.LayoutModificationException;
@@ -8,22 +18,10 @@ import org.corfudb.runtime.view.Layout.ReplicationMode;
 import org.corfudb.runtime.view.LayoutBuilder;
 import org.junit.Test;
 
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatThrownBy;
-
 /**
  * Created by zlokhandwala on 10/26/16.
  */
 public class LayoutBuilderTest extends AbstractCorfuTest {
-
-    private static final int SERVER_ENTRY_3 = 3;
-    private static final int SERVER_ENTRY_4 = 4;
 
     /**
      * Tests the Layout Builder by removing nodes.
@@ -32,7 +30,11 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
      *                                     logunit nodes removed. Invalid removal.
      */
     @Test
+    @SuppressWarnings("checkstyle:magicnumber")
     public void checkRemovalOfNodes() throws LayoutModificationException {
+        final int SERVER_ENTRY_3 = 3;
+        final int SERVER_ENTRY_4 = 4;
+
         Layout originalLayout = new TestLayoutBuilder()
                 .setEpoch(1L)
                 .addLayoutServer(SERVERS.PORT_0)
@@ -44,7 +46,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
                 .addSequencer(SERVERS.PORT_1)
                 .addSequencer(SERVERS.PORT_2)
                 .buildSegment()
-                .setReplicationMode(ReplicationMode.QUORUM_REPLICATION)
+                .setReplicationMode(ReplicationMode.CHAIN_REPLICATION)
                 .buildStripe()
                 .addLogUnit(SERVERS.PORT_0)
                 .addLogUnit(SERVERS.PORT_2)
@@ -71,11 +73,9 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         //Preparing failed nodes set.
         failedNodes.addAll(allNodes);
 
-
         /*
          * Invalid Removals
          */
-
         // Deleting all Layout Servers
         assertThatThrownBy(() -> layoutBuilder.removeLayoutServers(failedNodes).build()
         ).isInstanceOf(LayoutModificationException.class);
@@ -92,6 +92,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         failedNodes.clear();
         failedNodes.add(allNodes.get(0));
         failedNodes.add(allNodes.get(2));
+        failedNodes.add(allNodes.get(3));
         assertThatThrownBy(() -> layoutBuilder.removeLogunitServers(failedNodes).build())
                 .isInstanceOf(LayoutModificationException.class);
 
@@ -99,7 +100,6 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         /*
          *  Valid Removal
          */
-
         // Deleting SERVERS.PORT_0 and SERVERS.PORT_4
         // Preparing new layout
         Layout expectedLayout = new TestLayoutBuilder()
@@ -110,7 +110,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
                 .addSequencer(SERVERS.PORT_1)
                 .addSequencer(SERVERS.PORT_2)
                 .buildSegment()
-                .setReplicationMode(ReplicationMode.QUORUM_REPLICATION)
+                .setReplicationMode(ReplicationMode.CHAIN_REPLICATION)
                 .buildStripe()
                 .addLogUnit(SERVERS.PORT_2)
                 .addLogUnit(SERVERS.PORT_3)
@@ -139,7 +139,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
                 .addLayoutServer(SERVERS.PORT_3)
                 .addSequencer(SERVERS.PORT_2)
                 .buildSegment()
-                .setReplicationMode(ReplicationMode.QUORUM_REPLICATION)
+                .setReplicationMode(ReplicationMode.CHAIN_REPLICATION)
                 .buildStripe()
                 .addLogUnit(SERVERS.PORT_2)
                 .addLogUnit(SERVERS.PORT_3)
@@ -176,14 +176,6 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         assertThatThrownBy(() -> layoutBuilder.removeSequencerServer(allNodes.get(2)))
                 .isInstanceOf(LayoutModificationException.class);
 
-        // Reject remove if redundancy is lost
-        assertThatThrownBy(() -> layoutBuilder.removeLogunitServer(allNodes.get(1)))
-                .isInstanceOf(LayoutModificationException.class);
-
-        // Reject remove if stripe size is one
-        assertThatThrownBy(() -> layoutBuilder.removeLogunitServer(allNodes.get(2)))
-                .isInstanceOf(LayoutModificationException.class);
-
         // Assert the resulting layout is equal to the expected
         assertThat(layoutBuilder.build()).isEqualTo(expectedLayout);
     }
@@ -202,7 +194,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
                 .addSequencer(SERVERS.PORT_1)
                 .addSequencer(SERVERS.PORT_2)
                 .buildSegment()
-                .setReplicationMode(ReplicationMode.QUORUM_REPLICATION)
+                .setReplicationMode(ReplicationMode.CHAIN_REPLICATION)
                 .buildStripe()
                 .addLogUnit(SERVERS.PORT_0)
                 .addLogUnit(SERVERS.PORT_2)
@@ -227,14 +219,10 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         assertThatThrownBy(() -> layoutBuilder.addLayoutServer(null))
                 .isInstanceOf(NullPointerException.class);
 
-        assertThatThrownBy(() -> layoutBuilder.addLogunitServer(0,
-                                                                0,
-                                                                null))
+        assertThatThrownBy(() -> layoutBuilder.addLogunitServer(0, 0, null))
                 .isInstanceOf(NullPointerException.class);
 
-        assertThatThrownBy(() -> layoutBuilder.addLogunitServerToSegment(null,
-                                                                         0,
-                                                                         0))
+        assertThatThrownBy(() -> layoutBuilder.addLogunitServerToSegment(null, 0, 0))
                 .isInstanceOf(NullPointerException.class);
 
         assertThatThrownBy(() -> layoutBuilder.addSequencerServer(null))
@@ -246,9 +234,7 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
         assertThatThrownBy(() -> layoutBuilder.assignResponsiveSequencerAsPrimary(null))
                 .isInstanceOf(NullPointerException.class);
 
-        assertThatThrownBy(() -> layoutBuilder.removeFromStripe(null,
-                                                                null,
-                                                                0))
+        assertThatThrownBy(() -> layoutBuilder.removeFromStripe(null, null, 0))
                 .isInstanceOf(NullPointerException.class);
 
         assertThatThrownBy(() -> layoutBuilder.removeLayoutServer(null))
@@ -278,12 +264,9 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
 
     /**
      * Tests the modification of the layout by the addition of new nodes.
-     *
-     * @throws Exception
      */
     @Test
-    public void checkAdditionOfNodes() throws Exception {
-
+    public void checkAdditionOfNodes() {
         Layout originalLayout = new TestLayoutBuilder()
                 .setEpoch(1L)
                 .addLayoutServer(SERVERS.PORT_0)
@@ -340,12 +323,9 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
      * Reassign a failover sequencer server from the set of responsive nodes.
      * It asserts that assigned sequencer server was not picked from
      * unresponsive servers
-     *
-     * @throws Exception
      */
     @Test
-    public void reassignResponsiveSequencer() throws Exception {
-
+    public void reassignResponsiveSequencer() {
         Layout originalLayout = new TestLayoutBuilder()
                 .setEpoch(1L)
                 .addLayoutServer(SERVERS.PORT_0)
@@ -393,11 +373,9 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
      * This test attempts to failover the sequencer server while all layout sequencers
      * are unresponsive. It verifies that {@link LayoutModificationException} is thrown
      * in case of such unsuccessful failover.
-     *
-     * @throws Exception
      */
-    @Test (expected = LayoutModificationException.class)
-    public void unsuccessfulSequencerFailoverThrowsException() throws Exception {
+    @Test(expected = LayoutModificationException.class)
+    public void unsuccessfulSequencerFailoverThrowsException() {
         Layout originalLayout = new TestLayoutBuilder()
                 .setEpoch(1L)
                 .addLayoutServer(SERVERS.PORT_0)
@@ -418,6 +396,61 @@ public class LayoutBuilderTest extends AbstractCorfuTest {
                 .addUnresponsiveServers(Collections.singleton(SERVERS.ENDPOINT_1))
                 .addUnresponsiveServers(Collections.singleton(SERVERS.ENDPOINT_2))
                 .assignResponsiveSequencerAsPrimary(Collections.singleton(SERVERS.ENDPOINT_0));
+
         layoutBuilder.build();
+    }
+
+    /**
+     * This test verifies that when primary sequencer fails over, we try to assign
+     * a non log tail node as new primary sequencer if possible to achieve better
+     * load distribution.
+     */
+    @Test
+    public void assignPrimarySequencerToNonTailNodeIfPossible() {
+        Layout originalLayout = new TestLayoutBuilder()
+                .setEpoch(1L)
+                .addLayoutServer(SERVERS.PORT_0)
+                .addLayoutServer(SERVERS.PORT_1)
+                .addLayoutServer(SERVERS.PORT_2)
+                .addSequencer(SERVERS.PORT_0)
+                .addSequencer(SERVERS.PORT_1)
+                .addSequencer(SERVERS.PORT_2)
+                .buildSegment()
+                .buildStripe()
+                .addLogUnit(SERVERS.PORT_1)
+                .addLogUnit(SERVERS.PORT_2)
+                .addToSegment()
+                .buildStripe()
+                .addLogUnit(SERVERS.PORT_2)
+                .addLogUnit(SERVERS.PORT_0)
+                .addToSegment()
+                .buildStripe()
+                .addLogUnit(SERVERS.PORT_2)
+                .addToSegment()
+                .addToLayout()
+                .build();
+
+        // All servers responsive, server 1 is the only non-tail node.
+        LayoutBuilder layoutBuilder = new LayoutBuilder(originalLayout);
+        Layout newLayout = layoutBuilder
+                .assignResponsiveSequencerAsPrimary(Collections.emptySet())
+                .build();
+        assertThat(newLayout.getPrimarySequencer()).isEqualTo(SERVERS.ENDPOINT_1);
+
+        // Server 1 excluded, new primary sequencer should be server 0 or server 2.
+        layoutBuilder = new LayoutBuilder(originalLayout);
+        newLayout = layoutBuilder
+                .assignResponsiveSequencerAsPrimary(Collections.singleton(SERVERS.ENDPOINT_1))
+                .build();
+        assertThat(newLayout.getPrimarySequencer()).isNotEqualTo(SERVERS.ENDPOINT_1);
+
+        // All servers are log tails, server 0 and server 1 unresponsive or excluded, elect server 2.
+        layoutBuilder = new LayoutBuilder(originalLayout);
+        layoutBuilder.addLogunitServerToSegment(SERVERS.ENDPOINT_1, 0, 2);
+        layoutBuilder.addUnresponsiveServers(Sets.newHashSet(SERVERS.ENDPOINT_1));
+        newLayout = layoutBuilder
+                .assignResponsiveSequencerAsPrimary(Collections.singleton(SERVERS.ENDPOINT_0))
+                .build();
+        assertThat(newLayout.getPrimarySequencer()).isEqualTo(SERVERS.ENDPOINT_2);
     }
 }

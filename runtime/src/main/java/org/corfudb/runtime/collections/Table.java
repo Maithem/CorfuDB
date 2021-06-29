@@ -2,26 +2,37 @@ package org.corfudb.runtime.collections;
 
 import com.google.protobuf.Descriptors;
 import com.google.protobuf.Message;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.protocols.wireprotocol.TokenResponse;
+import org.corfudb.runtime.CorfuOptions;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.Queue;
+import org.corfudb.runtime.object.ICorfuVersionPolicy;
+import org.corfudb.runtime.object.transactions.TransactionType;
+import org.corfudb.runtime.object.transactions.TransactionalContext;
+import org.corfudb.runtime.view.CorfuGuidGenerator;
+import org.corfudb.util.serializer.ISerializer;
 
-import java.util.*;
-import java.util.Map.Entry;
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
+import java.util.AbstractMap;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
-
-import lombok.NonNull;
-import org.corfudb.runtime.CorfuOptions;
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.object.ICorfuVersionPolicy;
-import org.corfudb.runtime.object.transactions.TransactionType;
-
-import org.corfudb.runtime.object.transactions.TransactionalContext;
-import org.corfudb.util.serializer.ISerializer;
-import lombok.Getter;
 
 /**
  * Wrapper over the CorfuTable.
@@ -29,6 +40,7 @@ import lombok.Getter;
  * The value is a CorfuRecord which comprises of 2 fields - Payload and Metadata. These are protobuf messages as well.
  * <p>
  */
+@Slf4j
 public class Table<K extends Message, V extends Message, M extends Message> {
 
     private final CorfuRuntime corfuRuntime;
@@ -48,30 +60,62 @@ public class Table<K extends Message, V extends Message, M extends Message> {
     private final String fullyQualifiedTableName;
 
     @Getter
+    private final UUID streamUUID;
+
+    @Getter
     private final MetadataOptions metadataOptions;
+
+    @Getter
+    private final Class<K> keyClass;
+
+    @Getter
+    private final Class<V> valueClass;
+
+    @Getter
+    private final Class<M> metadataClass;
+
+    @Getter
+    private final Set<UUID> streamTags;
+
+    /**
+     * In case this table is opened as a Queue, we need the Guid generator to support enqueue operations.
+     */
+    private final CorfuGuidGenerator guidGenerator;
 
     /**
      * Returns a Table instance backed by a CorfuTable.
      *
-     * @param namespace               Namespace of the table.
-     * @param fullyQualifiedTableName Fully qualified table name.
-     * @param valueSchema             Value schema to identify secondary keys.
-     * @param corfuRuntime            Connected instance of the Corfu Runtime.
-     * @param serializer              Protobuf Serializer.
+     * @param namespace               namespace of the table
+     * @param fullyQualifiedTableName Fully qualified table name
+     * @param kClass                  key class
+     * @param vClass                  value class
+     * @param mClass                  metadata class
+     * @param valueSchema             value schema to identify secondary keys
+     * @param metadataSchema          default metadata instance
+     * @param corfuRuntime            connected instance of the Corfu Runtime
+     * @param serializer              protobuf serializer
+     * @param streamingMapSupplier    supplier of underlying map data structure
+     * @param versionPolicy           versioning policy
      */
     @Nonnull
     public Table(@Nonnull final String namespace,
                  @Nonnull final String fullyQualifiedTableName,
+                 @Nonnull final Class<K> kClass,
+                 @Nonnull final Class<V> vClass,
+                 @Nullable final Class<M> mClass,
                  @Nonnull final V valueSchema,
                  @Nullable final M metadataSchema,
                  @Nonnull final CorfuRuntime corfuRuntime,
                  @Nonnull final ISerializer serializer,
                  @Nonnull final Supplier<StreamingMap<K, V>> streamingMapSupplier,
-                 @NonNull final ICorfuVersionPolicy.VersionPolicy versionPolicy) {
+                 @NonNull final ICorfuVersionPolicy.VersionPolicy versionPolicy,
+                 @NonNull final Set<UUID> streamTags) {
 
         this.corfuRuntime = corfuRuntime;
         this.namespace = namespace;
         this.fullyQualifiedTableName = fullyQualifiedTableName;
+        this.streamUUID = CorfuRuntime.getStreamID(this.fullyQualifiedTableName);
+        this.streamTags = streamTags;
         this.metadataOptions = Optional.ofNullable(metadataSchema)
                 .map(schema -> MetadataOptions.builder()
                         .metadataEnabled(true)
@@ -84,7 +128,17 @@ public class Table<K extends Message, V extends Message, M extends Message> {
                 .setStreamName(this.fullyQualifiedTableName)
                 .setSerializer(serializer)
                 .setArguments(new ProtobufIndexer(valueSchema), streamingMapSupplier, versionPolicy)
+                .setStreamTags(streamTags)
                 .open();
+        this.keyClass = kClass;
+        this.valueClass = vClass;
+        this.metadataClass = mClass;
+        if (kClass == Queue.CorfuGuidMsg.class &&
+                mClass == Queue.CorfuQueueMetadataMsg.class) { // Really a Queue
+            this.guidGenerator = CorfuGuidGenerator.getInstance(corfuRuntime);
+        } else {
+            this.guidGenerator = null;
+        }
     }
 
     /**
@@ -96,7 +150,7 @@ public class Table<K extends Message, V extends Message, M extends Message> {
         }
         corfuRuntime.getObjectsView()
                 .TXBuild()
-                .type(TransactionType.OPTIMISTIC)
+                .type(TransactionType.WRITE_AFTER_WRITE)
                 .build()
                 .begin();
         return true;
@@ -118,6 +172,7 @@ public class Table<K extends Message, V extends Message, M extends Message> {
      * @return Previously stored record if any.
      */
     @Nullable
+    @Deprecated
     CorfuRecord<V, M> create(@Nonnull final K key,
                              @Nullable final V value,
                              @Nullable final M metadata) {
@@ -164,6 +219,7 @@ public class Table<K extends Message, V extends Message, M extends Message> {
      * @return Previously stored value for the provided key.
      */
     @Nullable
+    @Deprecated
     CorfuRecord<V, M> update(@Nonnull final K key,
                              @Nonnull final V value,
                              @Nullable final M metadata) {
@@ -196,12 +252,27 @@ public class Table<K extends Message, V extends Message, M extends Message> {
     }
 
     /**
+     * Update an existing key with the provided value. Create if it does not exist.
+     *
+     * @param key      Key.
+     * @param value    Value.
+     * @param metadata Metadata.
+     * @return Previously stored value for the provided key - null if create.
+     */
+    CorfuRecord<V, M> put(@Nonnull final K key,
+                          @Nonnull final V value,
+                          @Nullable final M metadata) {
+        return corfuTable.put(key, new CorfuRecord<>(value, metadata));
+    }
+
+    /**
      * Delete a record mapped to the specified key.
      *
      * @param key Key.
      * @return Previously stored Corfu Record.
      */
     @Nullable
+    @Deprecated
     CorfuRecord<V, M> delete(@Nonnull final K key) {
         boolean beganNewTxn = false;
         try {
@@ -215,17 +286,184 @@ public class Table<K extends Message, V extends Message, M extends Message> {
     }
 
     /**
+     * Delete a record mapped to the specified key.
+     *
+     * @param key Key.
+     * @return Previously stored Corfu Record.
+     */
+    @Nullable
+    CorfuRecord<V, M> deleteRecord(@Nonnull final K key) {
+        return corfuTable.remove(key);
+    }
+
+    /**
+     * Clear All table entries.
+     */
+    void clearAll() {
+       corfuTable.clear();
+    }
+
+    /**
      * Clears the table.
      */
+    @Deprecated
     public void clear() {
         boolean beganNewTxn = false;
         try {
             beganNewTxn = TxBegin();
-            corfuTable.clear();
+            clearAll();
         } finally {
             if (beganNewTxn) {
                 TxEnd();
             }
+        }
+    }
+
+    /**
+     * Appends the specified element at the end of this unbounded queue.
+     * Capacity restrictions and backoffs must be implemented outside this
+     * interface. Consider validating the size of the queue against a high
+     * watermark before enqueue.
+     *
+     * @param e the element to add
+     * @throws IllegalArgumentException if some property of the specified
+     *         element prevents it from being added to this queue
+     */
+    public K enqueue(V e) {
+        /**
+         * This is a callback that is placed into the root transaction's context on
+         * the thread local stack which will be invoked right after this transaction
+         * is deemed successful and has obtained a final sequence number to write.
+         */
+        @AllArgsConstructor
+        class QueueEntryAddressGetter implements TransactionalContext.PreCommitListener {
+            private CorfuRecord<V, M> record;
+
+            /**
+             * If we are in a transaction, determine the commit address and fix it up in
+             * the queue entry's metadata.
+             * @param tokenResponse - the sequencer's token response returned.
+             */
+            @Override
+            public void preCommitCallback(TokenResponse tokenResponse) {
+                record.setMetadata((M)Queue.CorfuQueueMetadataMsg.newBuilder()
+                        .setTxSequence(tokenResponse.getSequence()).build());
+                log.trace("preCommitCallback for Queue: " + tokenResponse);
+            }
+        }
+
+        // Obtain a cluster-wide unique 64-bit id to identify this entry in the queue.
+        long entryId = guidGenerator.nextLong();
+        // Embed this key into a protobuf.
+        K keyOfQueueEntry = (K)Queue.CorfuGuidMsg.newBuilder().setInstanceId(entryId).build();
+
+        // Prepare a partial record with the queue's payload and temporary metadata that will be overwritten
+        // by the QueueEntryAddressGetter callback above when the transaction finally commits.
+        CorfuRecord<V, M> queueEntry = new CorfuRecord<>(e,
+                (M)Queue.CorfuQueueMetadataMsg.newBuilder().setTxSequence(0).build());
+
+        QueueEntryAddressGetter addressGetter = new QueueEntryAddressGetter(queueEntry);
+        log.trace("enqueue: Adding preCommitListener for Queue: " + e.toString());
+        TransactionalContext.getRootContext().addPreCommitListener(addressGetter);
+
+        corfuTable.put(keyOfQueueEntry, queueEntry);
+        return keyOfQueueEntry;
+    }
+
+    /**
+     * Returns a List of CorfuQueueRecords sorted by the order in which the enqueue materialized.
+     * This is the primary method of consumption of entries enqueued into CorfuQueue.
+     *
+     * <p>This function currently does not return a view like the java.util implementation,
+     * and changes to the entryList will *not* be reflected in the map. </p>
+     *
+     * @return List of Entries sorted by their enqueue order
+     */
+    public List<CorfuQueueRecord>  entryList() {
+        Comparator<Map.Entry<K, CorfuRecord<V,M>>> queueComparator =
+                (Map.Entry<K, CorfuRecord<V,M>> rec1, Map.Entry<K, CorfuRecord<V,M>> rec2) -> {
+                    long r1EntryId = ((Queue.CorfuGuidMsg)rec1.getKey()).getInstanceId();
+                    long r1Sequence = ((Queue.CorfuQueueMetadataMsg)rec1.getValue().getMetadata()).getTxSequence();
+
+                    long r2EntryId = ((Queue.CorfuGuidMsg)rec2.getKey()).getInstanceId();
+                    long r2Sequence = ((Queue.CorfuQueueMetadataMsg)rec2.getValue().getMetadata()).getTxSequence();
+                    return CorfuQueueRecord.compareTo(r1EntryId, r2EntryId, r1Sequence, r2Sequence);
+                };
+
+        List<CorfuQueueRecord> copy = new ArrayList<>(corfuTable.size());
+        for (Map.Entry<K, CorfuRecord<V,M>> entry : corfuTable.entryStream()
+                .sorted(queueComparator).collect(Collectors.toList())) {
+            copy.add(new CorfuQueueRecord((Queue.CorfuGuidMsg)entry.getKey(),
+                    (Queue.CorfuQueueMetadataMsg)entry.getValue().getMetadata(),
+                    entry.getValue().getPayload()));
+        }
+        return copy;
+    }
+
+    /**
+     * CorfuQueueRecord encapsulates each entry enqueued into CorfuQueue with its unique ID.
+     * It is a read-only type returned by the entryList() method.
+     * The ID returned here can be used for both point get()s as well as remove() operations
+     * on this Queue.
+     *
+     */
+    public static class CorfuQueueRecord implements Comparable<CorfuQueueRecord> {
+        /**
+         * This ID represents the entry and its order in the Queue.
+         * This implies that it is unique and comparable with other IDs
+         * returned from CorfuQueue methods with respect to its enqueue order.
+         * because if this method is wrapped in a transaction, the order is established only later.
+         */
+        @Getter
+        private final Queue.CorfuGuidMsg recordId;
+
+        @Getter
+        private final Queue.CorfuQueueMetadataMsg txSequence;
+
+        @Getter
+        private final Message entry;
+
+        public String toString() {
+            return String.format("%s | %s =>%s", recordId, txSequence, entry);
+        }
+
+        CorfuQueueRecord(Queue.CorfuGuidMsg entryId, Queue.CorfuQueueMetadataMsg txSequence, Message entry) {
+            this.recordId = entryId;
+            this.txSequence = txSequence;
+            this.entry = entry;
+        }
+
+        public static int compareTo(long thisEntryId, long thatEntryId, long thisSequence, long thatSequence) {
+            if (thisEntryId == thatEntryId && thisSequence == thatSequence) {
+                return 0;
+            }
+            if (thisSequence > thatSequence) {
+                return 1;
+            }
+            if (thisSequence == thatSequence && thisEntryId > thatEntryId) {
+                return 1;
+            }
+            return -1;
+        }
+
+        @Override
+        public int compareTo(CorfuQueueRecord o) {
+            return compareTo(this.getRecordId().getInstanceId(), ((CorfuQueueRecord) o).recordId.getInstanceId(),
+                    this.getTxSequence().getTxSequence(), ((CorfuQueueRecord) o).getTxSequence().getTxSequence());
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            CorfuQueueRecord that = (CorfuQueueRecord) o;
+            return this.getRecordId().getInstanceId() == that.getRecordId().getInstanceId() &&
+                    this.getTxSequence().getTxSequence() == that.getTxSequence().getTxSequence();
+        }
+
+        @Override
+        public int hashCode() {
+            return recordId.hashCode();
         }
     }
 
@@ -298,15 +536,34 @@ public class Table<K extends Message, V extends Message, M extends Message> {
     /**
      * Get by secondary index.
      *
+     * @param <I>       Type of index key.
      * @param indexName Index name.
      * @param indexKey  Index key.
-     * @param <I>       Type of index key.
      * @return Collection of entries filtered by the secondary index.
      */
     @Nonnull
-    protected <I extends Comparable<I>>
-    Collection<Entry<K, V>> getByIndex(@Nonnull final String indexName,
-                                       @Nonnull final I indexKey) {
+    <I>
+    List<CorfuStoreEntry<K, V, M>> getByIndex(@Nonnull final String indexName,
+                    @Nonnull final I indexKey) {
+        return corfuTable.getByIndex(() -> indexName, indexKey).stream()
+                .map(entry -> new CorfuStoreEntry<K, V, M>(entry.getKey(),
+                        entry.getValue().getPayload(),
+                        entry.getValue().getMetadata()))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Get by secondary index.
+     *
+     * @param <I>       Type of index key.
+     * @param indexName Index name.
+     * @param indexKey  Index key.
+     * @return Collection of entries filtered by the secondary index.
+     */
+    @Nonnull
+    protected <I>
+    Collection<Map.Entry<K, V>> getByIndexAsQueryResult(@Nonnull final String indexName,
+                                                        @Nonnull final I indexKey) {
         return corfuTable.getByIndex(() -> indexName, indexKey).stream()
                 .map(entry -> new AbstractMap.SimpleEntry<>(entry.getKey(), entry.getValue().getPayload()))
                 .collect(Collectors.toList());
@@ -321,6 +578,7 @@ public class Table<K extends Message, V extends Message, M extends Message> {
             Descriptors.FieldDescriptor.Type.SFIXED64
     ));
 
+    @Deprecated
     private M mergeOldAndNewMetadata(@Nonnull M previousMetadata,
                                      @Nullable M userMetadata, boolean isCreate) {
         M.Builder builder = previousMetadata.toBuilder();
@@ -343,6 +601,7 @@ public class Table<K extends Message, V extends Message, M extends Message> {
         return (M) builder.build();
     }
 
+    @Deprecated
     private void validateVersion(@Nullable M previousMetadata,
                                  @Nullable M userMetadata) {
         // TODO: do a lookup instead of a search if possible

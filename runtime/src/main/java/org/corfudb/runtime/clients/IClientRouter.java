@@ -1,8 +1,14 @@
 package org.corfudb.runtime.clients;
 
+import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
+import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
 import java.util.concurrent.CompletableFuture;
 
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
+import org.corfudb.runtime.proto.RpcCommon.UuidMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+
+import javax.annotation.Nonnull;
 
 /**
  * This is an interface in which all client routers must implement.
@@ -23,21 +29,46 @@ public interface IClientRouter {
     IClientRouter addClient(IClient client);
 
     /**
-     * Send a message and get a completable future to be fulfilled by the reply.
+     * Send a request message and get a completable future to be fulfilled by the reply.
      *
-     * @param message The message to send.
-     * @param <T>     The type of completable to return.
+     * @param payload
+     * @param epoch
+     * @param clusterId
+     * @param priority
+     * @param ignoreClusterId
+     * @param ignoreEpoch
+     * @param <T> The type of completable to return.
      * @return A completable future which will be fulfilled by the reply,
      * or a timeout in the case there is no response.
      */
-    <T> CompletableFuture<T> sendMessageAndGetCompletable(CorfuMsg message);
+    <T> CompletableFuture<T> sendRequestAndGetCompletable(CorfuMessage.RequestPayloadMsg payload, long epoch,
+                                                          UuidMsg clusterId, CorfuMessage.PriorityLevel priority,
+                                                          ClusterIdCheck ignoreClusterId, EpochCheck ignoreEpoch);
+
+    /**
+     * Send a request message and get a completable future to be fulfilled by the reply.
+     *
+     * @param payload
+     * @param <T> The type of completable to return.
+     * @return A completable future which will be fulfilled by the reply,
+     * or a timeout in the case there is no response.
+     */
+    <T> CompletableFuture<T> sendRequestAndGetCompletable(
+            @Nonnull RequestPayloadMsg payload,
+            @Nonnull String endpoint);
 
     /**
      * Send a one way message, without adding a completable future.
      *
-     * @param message The message to send.
+     * @param payload
+     * @param epoch
+     * @param clusterId
+     * @param priority
+     * @param ignoreClusterId
+     * @param ignoreEpoch
      */
-    void sendMessage(CorfuMsg message);
+    void sendRequest(CorfuMessage.RequestPayloadMsg payload, long epoch, UuidMsg clusterId,
+                     CorfuMessage.PriorityLevel priority, ClusterIdCheck ignoreClusterId, EpochCheck ignoreEpoch);
 
     /**
      * Complete a given outstanding request with a completion value.

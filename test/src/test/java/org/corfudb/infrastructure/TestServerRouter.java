@@ -1,20 +1,25 @@
 package org.corfudb.infrastructure;
 
+import com.google.protobuf.TextFormat;
 import io.netty.channel.ChannelHandlerContext;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
+import org.corfudb.protocols.service.CorfuProtocolMessage;
 import org.corfudb.runtime.clients.TestChannelContext;
 import org.corfudb.runtime.clients.TestRule;
+import org.corfudb.runtime.proto.service.CorfuMessage.HeaderMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 import org.corfudb.runtime.view.Layout;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -24,10 +29,10 @@ import java.util.concurrent.atomic.AtomicLong;
 public class TestServerRouter implements IServerRouter {
 
     @Getter
-    public List<CorfuMsg> responseMessages;
+    public List<ResponseMsg> protoResponseMessages;
 
     @Getter
-    public Map<CorfuMsgType, AbstractServer> handlerMap;
+    public Map<RequestPayloadMsg.PayloadCase, AbstractServer> requestTypeHandlerMap;
 
     @Getter
     public ArrayList<AbstractServer> servers;
@@ -56,24 +61,36 @@ public class TestServerRouter implements IServerRouter {
     }
 
     public void reset() {
-        this.responseMessages = new ArrayList<>();
+        this.protoResponseMessages = new ArrayList<>();
         this.requestCounter = new AtomicLong();
         this.servers = new ArrayList<>();
-        this.handlerMap = new ConcurrentHashMap<>();
+        // EnumMap is not thread-safe - https://docs.oracle.com/javase/7/docs/api/java/util/EnumMap.html
+        this.requestTypeHandlerMap = Collections.synchronizedMap(new EnumMap<>(RequestPayloadMsg.PayloadCase.class));
         this.rules = new ArrayList<>();
     }
 
-    @Override
-    public void sendResponse(ChannelHandlerContext ctx, CorfuMsg inMsg, CorfuMsg outMsg) {
-        outMsg.copyBaseFields(inMsg);
-        outMsg.setEpoch(getServerEpoch());
+    /**
+     * Send a response message through this router.
+     *
+     * @param response The response message to send.
+     * @param ctx      The context of the channel handler.
+     */
+    public void sendResponse(ResponseMsg response, ChannelHandlerContext ctx) {
+        // Set the server epoch; protobuf objects are immutable, hence create a new object
+        ResponseMsg newResponse = CorfuProtocolMessage.getResponseMsg(
+                HeaderMsg.newBuilder(response.getHeader()).setEpoch(getServerEpoch()).build(),
+                response.getPayload());
+
         if (rules.stream()
-                .map(x -> x.evaluate(outMsg, this))
-                .allMatch(x -> x)) {
-            if (ctx != null && ctx instanceof TestChannelContext) {
-                ctx.writeAndFlush(outMsg);
+                .allMatch(x -> x.evaluate(newResponse, this))) {
+            if (ctx instanceof TestChannelContext) {
+                ctx.writeAndFlush(newResponse);
+                log.info("sendResponse: Sent {} - {}", response.getPayload().getPayloadCase(),
+                        TextFormat.shortDebugString(response.getHeader()));
             } else {
-                this.responseMessages.add(outMsg);
+                this.protoResponseMessages.add(newResponse);
+                log.info("sendResponse: Added response - {} to protoResponseMessages List.",
+                        TextFormat.shortDebugString(response.getHeader()));
             }
         }
     }
@@ -81,9 +98,9 @@ public class TestServerRouter implements IServerRouter {
     @Override
     public void addServer(AbstractServer server) {
         servers.add(server);
-        server.getHandler()
-                .getHandledTypes().forEach(x -> {
-            handlerMap.put(x, server);
+
+        server.getHandlerMethods().getHandledTypes().forEach(x -> {
+            requestTypeHandlerMap.put(x, server);
             log.trace("Registered {} to handle messages of type {}", server, x);
         });
     }
@@ -93,22 +110,18 @@ public class TestServerRouter implements IServerRouter {
         return servers;
     }
 
-    public void sendServerMessage(CorfuMsg msg) {
-        sendServerMessage(msg, null);
-    }
-
-    public void sendServerMessage(CorfuMsg msg, ChannelHandlerContext ctx) {
-        AbstractServer as = handlerMap.get(msg.getMsgType());
-        if (messageIsValid(msg, ctx)) {
+    public void sendServerMessage(RequestMsg request, ChannelHandlerContext ctx) {
+        AbstractServer as = requestTypeHandlerMap.get(request.getPayload().getPayloadCase());
+        if (validateRequest(request, ctx)) {
             if (as != null) {
                 // refactor and move threading to handler
-                as.handleMessage(msg, ctx, this);
+                as.handleMessage(request, ctx, this);
             }
             else {
-                log.trace("Unregistered message of type {} sent to router", msg.getMsgType());
+                log.trace("Unregistered message of type {} sent to router", request.getPayload().getPayloadCase());
             }
         } else {
-            log.trace("Message with wrong epoch {}, expected {}", msg.getEpoch(), serverEpoch);
+            log.trace("Message with wrong epoch {}, expected {}", request.getHeader().getEpoch(), serverEpoch);
         }
     }
 

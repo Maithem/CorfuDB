@@ -3,10 +3,9 @@ package org.corfudb.infrastructure.logreplication.infrastructure;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
-
-import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.TopologyConfigurationMsg;
-import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.ClusterRole;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.ClusterConfigurationMsg;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.ClusterRole;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.TopologyConfigurationMsg;
 
 import java.util.Collection;
 import java.util.Collections;
@@ -151,10 +150,10 @@ public class TopologyDescriptor {
     /**
      * Get the Cluster Descriptor to which a given endpoint belongs to.
      *
-     * @param endpoint
+     * @param nodeId
      * @return cluster descriptor to which endpoint belongs to.
      */
-    public ClusterDescriptor getClusterDescriptor(String endpoint) {
+    public ClusterDescriptor getClusterDescriptor(String nodeId) {
         List<ClusterDescriptor> clusters = Stream.of(activeClusters.values(), standbyClusters.values(),
                 invalidClusters.values())
                 .flatMap(Collection::stream)
@@ -162,19 +161,19 @@ public class TopologyDescriptor {
 
         for(ClusterDescriptor cluster : clusters) {
             for (NodeDescriptor node : cluster.getNodesDescriptors()) {
-                if (node.getEndpoint().equals(endpoint)) {
+                if (node.getNodeId().equals(nodeId)) {
                     return cluster;
                 }
             }
         }
+        log.warn("Node {} does not belong to any cluster defined in {}", nodeId, clusters);
 
-        log.trace("Endpoint {} does not belong to any cluster defined in {}", endpoint, clusters);
         return null;
     }
 
     @Override
     public String toString() {
-        return String.format("Topology[%s] :: Active Cluster=%s :: Standby Clusters=%s :: Invalid Clusters=%s",
+        return String.format("Topology[id=%s] :: Active Cluster=%s :: Standby Clusters=%s :: Invalid Clusters=%s",
                 topologyConfigId, activeClusters, standbyClusters, invalidClusters);
     }
 }

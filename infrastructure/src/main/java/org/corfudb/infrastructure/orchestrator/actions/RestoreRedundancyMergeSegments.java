@@ -7,6 +7,7 @@ import lombok.Builder.Default;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.infrastructure.log.statetransfer.StateTransferManager;
 import org.corfudb.infrastructure.log.statetransfer.batchprocessor.committedbatchprocessor.CommittedBatchProcessor;
 import org.corfudb.infrastructure.log.statetransfer.batchprocessor.protocolbatchprocessor.ProtocolBatchProcessor;
@@ -44,6 +45,7 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.corfudb.infrastructure.log.statetransfer.segment.TransferSegmentStatus.SegmentState.FAILED;
 import static org.corfudb.infrastructure.log.statetransfer.segment.TransferSegmentStatus.SegmentState.TRANSFERRED;
@@ -130,14 +132,21 @@ public class RestoreRedundancyMergeSegments extends Action {
                 Optional<Long> committedTail =
                         tryGetCommittedTail(runtime.getLayoutView().getRuntimeLayout());
 
-                // Execute state transfer.
-                ImmutableList<TransferSegment> transferSegments = ImmutableList.copyOf(
+                // Execute state transfer and return the list of transferred transfer segments.
+                ImmutableList<TransferSegment> transferredSegments = ImmutableList.copyOf(
                         getTransferSegments(transferManager, currentLayout,
                                 trimMark, committedTail));
 
-                // Get all the transferred segments as well as the current layout.
+                // Get segments that were trimmed but do not include the current node, if any.
+                ImmutableList<TransferSegment> trimmedNotRestoredSegments =
+                        redundancyCalculator.getTrimmedNotRestoredSegments(currentLayout, trimMark);
+
+                ImmutableList<TransferSegment> segmentsToGetRestored =
+                        Stream.concat(trimmedNotRestoredSegments.stream(), transferredSegments.stream())
+                                .collect(ImmutableList.toImmutableList());
+                // Get all the restorable segments as well as the current layout.
                 LayoutTransferSegments layoutTransferSegments =
-                        new LayoutTransferSegments(currentLayout, transferSegments);
+                        new LayoutTransferSegments(currentLayout, segmentsToGetRestored);
 
                 // Transfer a new committed tail after all segments are transferred.
                 // The new committed tail is the last transferred address.
@@ -414,6 +423,16 @@ public class RestoreRedundancyMergeSegments extends Action {
         return "RestoreRedundancyAndMergeSegments";
     }
 
+    private void registerMetricsIfNeeded() {
+        // If the call has occurred previously, this function does nothing.
+        MeterRegistryProvider.getInstance().ifPresent(registry -> {
+            registry.timer("state-transfer.timer", "type", "protocol");
+            registry.timer("state-transfer.timer", "type", "committed");
+            registry.counter("state-transfer.read.throughput", "type", "protocol");
+            registry.counter("state-transfer.read.throughput", "type", "committed");
+        });
+    }
+
     @Override
     public void impl(@Nonnull CorfuRuntime runtime) throws Exception {
 
@@ -458,6 +477,8 @@ public class RestoreRedundancyMergeSegments extends Action {
                         .basicTransferProcessor(basicTransferProcessor)
                         .parallelTransferProcessor(parallelTransferProcessor)
                         .build();
+
+        registerMetricsIfNeeded();
 
         // While a redundancy can be restored or segments can be merged, perform a state transfer
         // and then restore a layout redundancy on the current node.

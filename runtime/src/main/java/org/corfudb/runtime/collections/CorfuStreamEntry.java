@@ -1,26 +1,25 @@
 package org.corfudb.runtime.collections;
 
 import com.google.protobuf.Message;
+import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-
-import javax.annotation.Nonnull;
-import javax.annotation.Nullable;
-
 import org.corfudb.protocols.logprotocol.SMREntry;
 
+import javax.annotation.Nonnull;
+
 /**
- * Entry returned by CorfuStore's StreamListener interface
+ * Entry returned by CorfuStore's StreamListener interface.
+ * NOTE: Ensure that the below protobuf generated classes are accessible to your JVM!
+ * <p>
+ * Created by hisundar on 2019-10-18
  *
  * @param <K> - type of the protobuf KeySchema defined while the table was created.
  * @param <V> - type of the protobuf PayloadSchema defined by the table creator.
  * @param <M> - type of the protobuf metadata schema defined by table creation.
- *
- *  NOTE: Ensure that the above protobuf generated classes are accessible to your JVM!
- *
- *  Created by hisundar on 2019-10-18
  */
 @Slf4j
+@EqualsAndHashCode
 public class CorfuStreamEntry<K extends Message, V extends Message, M extends Message> {
     /**
      * Key of the UFO stream entry
@@ -46,16 +45,18 @@ public class CorfuStreamEntry<K extends Message, V extends Message, M extends Me
     public enum OperationType {
         UPDATE,
         DELETE,
-        CLEAR;
-    };
+        CLEAR
+    }
 
     @Getter
     private final OperationType operation;
+
     /**
      * Version number of the layout at the time of this entry.
      */
     @Getter
     private final long epoch;
+
     /**
      * Stream address of this entry
      */
@@ -75,37 +76,12 @@ public class CorfuStreamEntry<K extends Message, V extends Message, M extends Me
      * Convert a given SMREntry to CorfuStreamEntry.
      */
     public static <K extends Message, V extends Message, M extends Message>
-        CorfuStreamEntry<K, V, M> fromSMREntry(SMREntry entry, @Nonnull final long epoch,
-                                               @Nonnull final Class<K> keyClass,
-                                               @Nonnull final Class<V> payloadClass,
-                                               @Nullable final Class<M> metadataClass) {
-
+    CorfuStreamEntry<K, V, M> fromSMREntry(SMREntry entry, final long epoch) {
         long address = entry.getGlobalAddress();
 
-        OperationType operationType;
-        log.trace("fromSRMEntry: Table {} streamer got SMR {}", keyClass.getName(), entry.getSMRMethod());
-        switch(entry.getSMRMethod()) {
-            case "put":
-            case "putAll":
-                operationType = OperationType.UPDATE;
-                break;
-            case "clear":
-                operationType = OperationType.CLEAR;
-                break;
-            case "remove":
-                operationType = OperationType.DELETE;
-                break;
-            default:
-                throw new RuntimeException("SMRMethod "+entry.getSMRMethod()
-                + " cannot be translated to CorfuStreamEntry");
-        }
-        // TODO[sneginhal]: Need a way to differentiate between update and create.
+        OperationType operationType = getOperationType(entry);
+        // TODO(sneginhal): Need a way to differentiate between update and create.
         Object[] args = entry.getSMRArguments();
-
-        log.trace("Converting SMREntry at address {} to CorfuStreamEntry: Operation: {} Length of arguments: {}. " +
-                "({} -> {}, {})",
-                address, operationType, args.length, keyClass.getCanonicalName(), payloadClass.getCanonicalName(),
-                (metadataClass != null) ? metadataClass.getCanonicalName() : "null");
 
         K key = null;
         V payload = null;
@@ -119,6 +95,27 @@ public class CorfuStreamEntry<K extends Message, V extends Message, M extends Me
             }
         }
 
-        return new CorfuStreamEntry<K, V, M>(key, payload, metadata, epoch, address, operationType);
+        return new CorfuStreamEntry<>(key, payload, metadata, epoch, address, operationType);
+    }
+
+    private static OperationType getOperationType(@Nonnull SMREntry entry) {
+        OperationType operationType;
+        switch (entry.getSMRMethod()) {
+            case "put":
+            case "putAll":
+                operationType = OperationType.UPDATE;
+                break;
+            case "clear":
+                operationType = OperationType.CLEAR;
+                break;
+            case "remove":
+                operationType = OperationType.DELETE;
+                break;
+            default:
+                throw new RuntimeException("SMRMethod " + entry.getSMRMethod()
+                        + " cannot be translated to any known operation type");
+        }
+
+        return operationType;
     }
 }

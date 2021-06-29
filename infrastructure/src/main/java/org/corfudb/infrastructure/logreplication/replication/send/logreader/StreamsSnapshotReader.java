@@ -1,21 +1,26 @@
 package org.corfudb.infrastructure.logreplication.replication.send.logreader;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.TextFormat;
+import io.micrometer.core.instrument.DistributionSummary;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
+import org.corfudb.common.util.Memory;
 import org.corfudb.common.util.ObservableValue;
 import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
 import org.corfudb.infrastructure.logreplication.replication.send.IllegalSnapshotEntrySizeException;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
-import org.corfudb.protocols.wireprotocol.logreplication.MessageType;
 import org.corfudb.protocols.logprotocol.OpaqueEntry;
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.LogReplication;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryType;
 import org.corfudb.runtime.exceptions.TrimmedException;
 import org.corfudb.runtime.view.Address;
 import org.corfudb.runtime.view.StreamOptions;
 import org.corfudb.runtime.view.stream.OpaqueStream;
-import org.corfudb.util.MetricsUtils;
 
 import javax.annotation.concurrent.NotThreadSafe;
 import java.util.ArrayList;
@@ -23,12 +28,17 @@ import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Stream;
 
+import static com.google.protobuf.UnsafeByteOperations.unsafeWrap;
 import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_DATA_MSG_SIZE_SUPPORTED;
+import static org.corfudb.protocols.CorfuProtocolCommon.getUuidMsg;
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.generatePayload;
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.getLrEntryMsg;
 
 @Slf4j
 @NotThreadSafe
@@ -44,7 +54,7 @@ public class StreamsSnapshotReader implements SnapshotReader {
      * The max size of data for SMR entries in data message.
      */
     private final int maxDataSizePerMsg;
-
+    private final Optional<DistributionSummary> messageSizeDistributionSummary;
     private long snapshotTimestamp;
     private Set<String> streams;
     private PriorityQueue<String> streamsToSend;
@@ -69,6 +79,7 @@ public class StreamsSnapshotReader implements SnapshotReader {
         this.rt.parseConfigurationString(runtime.getLayoutServers().get(0)).connect();
         this.maxDataSizePerMsg = config.getMaxDataSizePerMsg();
         this.streams = config.getStreamsToReplicate();
+        this.messageSizeDistributionSummary = configureMessageSizeDistributionSummary();
     }
 
     /**
@@ -90,7 +101,10 @@ public class StreamsSnapshotReader implements SnapshotReader {
      * @param entryList
      * @return
      */
-    private LogReplicationEntry generateMessage(OpaqueStreamIterator stream, SMREntryList entryList, UUID snapshotRequestId) {
+    private LogReplicationEntryMsg generateMessage(
+            OpaqueStreamIterator stream,
+            SMREntryList entryList,
+            UUID snapshotRequestId) {
         currentMsgTs = stream.maxVersion;
         OpaqueEntry opaqueEntry = generateOpaqueEntry(currentMsgTs, stream.uuid, entryList);
         if (!stream.iterator.hasNext()) {
@@ -98,15 +112,24 @@ public class StreamsSnapshotReader implements SnapshotReader {
             currentMsgTs = snapshotTimestamp;
         }
 
-        LogReplicationEntry txMsg = new LogReplicationEntry(MessageType.SNAPSHOT_MESSAGE, topologyConfigId, snapshotRequestId, currentMsgTs,
-                preMsgTs, snapshotTimestamp, sequence, opaqueEntry);
+        LogReplication.LogReplicationEntryMetadataMsg metadata = LogReplication.LogReplicationEntryMetadataMsg.newBuilder()
+                .setEntryType(LogReplicationEntryType.SNAPSHOT_MESSAGE)
+                .setTopologyConfigID(topologyConfigId)
+                .setSyncRequestId(getUuidMsg(snapshotRequestId))
+                .setTimestamp(currentMsgTs)
+                .setPreviousTimestamp(preMsgTs)
+                .setSnapshotTimestamp(snapshotTimestamp)
+                .setSnapshotSyncSeqNum(sequence)
+                .build();
+
+        LogReplicationEntryMsg txMsg = getLrEntryMsg(unsafeWrap(generatePayload(opaqueEntry)), metadata);
 
         preMsgTs = currentMsgTs;
         sequence++;
 
         log.trace("txMsg {} deepsize sizeInBytes {} entryList.sizeInByres {}  with numEntries {} deepSize sizeInBytes {}",
-                txMsg.getMetadata(), MetricsUtils.sizeOf.deepSizeOf(txMsg), entryList.getSizeInBytes(), entryList.getSmrEntries().size(), MetricsUtils.sizeOf.deepSizeOf(entryList.smrEntries));
-
+                TextFormat.printToString(txMsg.getMetadata()), Memory.sizeOf.deepSizeOf(txMsg), entryList.getSizeInBytes(),
+                entryList.getSmrEntries().size(), Memory.sizeOf.deepSizeOf(entryList.smrEntries));
         return txMsg;
     }
 
@@ -157,7 +180,7 @@ public class StreamsSnapshotReader implements SnapshotReader {
                 }
             }
         } catch (TrimmedException e) {
-            log.error("Catch an TrimmedException exception ", e);
+            log.error("Caught a TrimmedException", e);
             throw e;
         }
 
@@ -172,12 +195,14 @@ public class StreamsSnapshotReader implements SnapshotReader {
      * @param stream bookkeeping of the current stream information.
      * @return
      */
-    private LogReplicationEntry read(OpaqueStreamIterator stream, UUID syncRequestId) {
+    private LogReplicationEntryMsg read(OpaqueStreamIterator stream, UUID syncRequestId) {
         SMREntryList entryList = next(stream);
-        LogReplicationEntry txMsg = generateMessage(stream, entryList, syncRequestId);
+        LogReplicationEntryMsg txMsg = generateMessage(stream, entryList, syncRequestId);
         log.info("Successfully generate a snapshot message for stream {} with snapshotTimestamp={}, numEntries={}, " +
                         "entriesBytes={}, streamId={}", stream.name, snapshotTimestamp,
                 entryList.getSmrEntries().size(), entryList.getSizeInBytes(), stream.uuid);
+        messageSizeDistributionSummary
+                .ifPresent(distribution -> distribution.record(entryList.getSizeInBytes()));
         return txMsg;
     }
 
@@ -189,10 +214,10 @@ public class StreamsSnapshotReader implements SnapshotReader {
      */
     @Override
     public SnapshotReadMessage read(UUID syncRequestId) {
-        List<LogReplicationEntry> messages = new ArrayList<>();
+        List<LogReplicationEntryMsg> messages = new ArrayList<>();
 
         boolean endSnapshotSync = false;
-        LogReplicationEntry msg;
+        LogReplicationEntryMsg msg;
 
         // If the currentStreamInfo still has entry to process, it will reuse the currentStreamInfo
         // and process the remaining entries.
@@ -275,6 +300,14 @@ public class StreamsSnapshotReader implements SnapshotReader {
     @Override
     public void setTopologyConfigId(long topologyConfigId) {
         this.topologyConfigId = topologyConfigId;
+    }
+
+    private Optional<DistributionSummary> configureMessageSizeDistributionSummary() {
+        return MeterRegistryProvider.getInstance().map(registry ->
+                DistributionSummary.builder("logreplication.message.size.bytes")
+                        .baseUnit("bytes")
+                        .tags("replication.type", "snapshot")
+                        .register(registry));
     }
 
     /**

@@ -5,39 +5,46 @@ import com.google.protobuf.DescriptorProtos.FileDescriptorProto;
 import com.google.protobuf.Descriptors.Descriptor;
 import com.google.protobuf.Descriptors.FileDescriptor;
 import com.google.protobuf.Message;
-import java.lang.reflect.InvocationTargetException;
-import java.util.Collection;
-import java.util.Deque;
-import java.util.LinkedList;
-import java.util.NoSuchElementException;
-import java.util.Optional;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
-
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.runtime.CorfuOptions;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata.TableDescriptors;
-import org.corfudb.runtime.CorfuStoreMetadata.TableName;
 import org.corfudb.runtime.CorfuStoreMetadata.TableMetadata;
+import org.corfudb.runtime.CorfuStoreMetadata.TableName;
 import org.corfudb.runtime.collections.CorfuRecord;
 import org.corfudb.runtime.collections.CorfuTable;
 import org.corfudb.runtime.collections.PersistedStreamingMap;
+import org.corfudb.runtime.collections.StreamManager;
+import org.corfudb.runtime.collections.StreamingManager;
 import org.corfudb.runtime.collections.StreamingMap;
 import org.corfudb.runtime.collections.StreamingMapDecorator;
 import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
+import org.corfudb.runtime.exceptions.SerializerException;
 import org.corfudb.runtime.exceptions.TransactionAbortedException;
 import org.corfudb.runtime.object.ICorfuVersionPolicy;
 import org.corfudb.runtime.object.transactions.TransactionType;
+import org.corfudb.runtime.object.transactions.TransactionalContext;
 import org.corfudb.util.serializer.ISerializer;
 import org.corfudb.util.serializer.ProtobufSerializer;
 import org.corfudb.util.serializer.Serializers;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
+import java.lang.reflect.InvocationTargetException;
+import java.util.Collection;
+import java.util.Deque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.NoSuchElementException;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
 
 /**
  * Table Registry manages the lifecycle of all the tables in the system.
@@ -61,15 +68,24 @@ public class TableRegistry {
     public static final String REGISTRY_TABLE_NAME = "RegistryTable";
 
     /**
+     * A common prefix for all string based stream tags defined in protobuf.
+     */
+    private static final String STREAM_TAG_PREFIX = "stream_tag$";
+
+    /**
      * Connected runtime instance.
      */
     private final CorfuRuntime runtime;
 
     /**
-     * Stores the schemas of the Key, Value and Metadata.
-     * A reference of this map is held by the {@link ProtobufSerializer} to serialize and deserialize the objects.
+     * A TableRegistry should just have one stream manager for lifecycle management.
      */
-    private final ConcurrentMap<String, Class<? extends Message>> classMap;
+    private StreamManager streamManager;
+
+    /**
+     * A TableRegistry should just have one streaming manager for lifecycle management.
+     */
+    private volatile StreamingManager streamingManager;
 
     /**
      * Cache of tables allowing the user to fetch a table by fullyQualified table name without the other options.
@@ -89,10 +105,20 @@ public class TableRegistry {
 
     public TableRegistry(CorfuRuntime runtime) {
         this.runtime = runtime;
-        this.classMap = new ConcurrentHashMap<>();
         this.tableMap = new ConcurrentHashMap<>();
-        this.protobufSerializer = new ProtobufSerializer(classMap);
-        Serializers.registerSerializer(this.protobufSerializer);
+        ISerializer protoSerializer;
+        try {
+            // If protobuf serializer is already registered, reference static/global class map so schemas
+            // are shared across all runtime's and not overwritten (if multiple runtime's exist).
+            // This aims to overcome a current design limitation where the serializers are static and not
+            // per runtime (to be changed).
+            protoSerializer = Serializers.getSerializer(ProtobufSerializer.PROTOBUF_SERIALIZER_CODE);
+        } catch (SerializerException se) {
+            // This means the protobuf serializer had not been registered yet.
+            protoSerializer = new ProtobufSerializer(new ConcurrentHashMap<>());
+            Serializers.registerSerializer(protoSerializer);
+        }
+        this.protobufSerializer = protoSerializer;
         this.registryTable = this.runtime.getObjectsView().build()
                 .setTypeToken(new TypeToken<CorfuTable<TableName, CorfuRecord<TableDescriptors, TableMetadata>>>() {
                 })
@@ -166,24 +192,25 @@ public class TableRegistry {
 
         TableMetadata.Builder metadataBuilder = TableMetadata.newBuilder();
         metadataBuilder.setDiskBased(tableOptions.getPersistentDataPath().isPresent());
+        metadataBuilder.setTableOptions(defaultValueMessage
+                .getDescriptorForType().getOptions()
+                .getExtension(CorfuOptions.tableSchema));
 
-        // Schema validation to ensure that there is either proper modification of the schema across open calls.
-        // Or no modification to the protobuf files.
-        boolean hasSchemaChanged = false;
-        CorfuRecord<TableDescriptors, TableMetadata> oldRecord = this.registryTable.get(tableNameKey);
-        if (oldRecord != null) {
-            if (!oldRecord.getPayload().getFileDescriptorsMap().equals(tableDescriptors.getFileDescriptorsMap())) {
-                hasSchemaChanged = true;
-                log.error("registerTable: Schema update detected for table "+namespace+" "+ tableName);
-                log.debug("registerTable: old schema:"+oldRecord.getPayload().getFileDescriptorsMap());
-                log.debug("registerTable: new schema:"+tableDescriptors.getFileDescriptorsMap());
-            }
-        }
         int numRetries = 9; // Since this is an internal transaction, retry a few times before giving up.
-        long finalAddress = Address.NON_ADDRESS;
         while (numRetries-- > 0) {
+            // Schema validation to ensure that there is either proper modification of the schema across open calls.
+            // Or no modification to the protobuf files.
             try {
-                this.runtime.getObjectsView().TXBuild().type(TransactionType.OPTIMISTIC).build().begin();
+                this.runtime.getObjectsView().TXBuild().type(TransactionType.WRITE_AFTER_WRITE).build().begin();
+                boolean hasSchemaChanged = false;
+                CorfuRecord<TableDescriptors, TableMetadata> oldRecord = this.registryTable.get(tableNameKey);
+                if (oldRecord != null && !oldRecord.getPayload().getFileDescriptorsMap()
+                        .equals(tableDescriptors.getFileDescriptorsMap())) {
+                    hasSchemaChanged = true;
+                    log.warn("registerTable: Schema update detected for table {}${}", namespace, tableName);
+                    log.debug("registerTable: old schema: {}", oldRecord.getPayload().getFileDescriptorsMap());
+                    log.debug("registerTable: new schema: {}", tableDescriptors.getFileDescriptorsMap());
+                }
                 if (hasSchemaChanged) {
                     this.registryTable.put(tableNameKey,
                             new CorfuRecord<>(tableDescriptors, metadataBuilder.build()));
@@ -191,7 +218,8 @@ public class TableRegistry {
                     this.registryTable.putIfAbsent(tableNameKey,
                             new CorfuRecord<>(tableDescriptors, metadataBuilder.build()));
                 }
-                finalAddress = this.runtime.getObjectsView().TXEnd();
+                this.runtime.getObjectsView().TXEnd();
+                break;
             } catch (TransactionAbortedException txAbort) {
                 if (numRetries <= 0) {
                     throw txAbort;
@@ -199,7 +227,7 @@ public class TableRegistry {
                 log.info("registerTable: commit failed. Will retry {} times. Cause {}", numRetries, txAbort);
                 continue;
             } finally {
-                if (finalAddress == Address.NON_ADDRESS) { // Transaction failed or an exception occurred.
+                if (TransactionalContext.isInTransaction()) { // Transaction failed or an exception occurred.
                     this.runtime.getObjectsView().TXAbort(); // clear Txn context so thread can be reused.
                 }
             }
@@ -265,6 +293,27 @@ public class TableRegistry {
     }
 
     /**
+     * Fully qualified table name created to produce the stream uuid.
+     *
+     * @param tableName TableName of the table.
+     * @return Fully qualified table name.
+     */
+    public static String getFullyQualifiedTableName(TableName tableName) {
+        return getFullyQualifiedTableName(tableName.getNamespace(), tableName.getTableName());
+    }
+
+    /**
+     * Return the stream Id for the provided stream tag.
+     *
+     * @param namespace namespace of the stream
+     * @param streamTag stream tag in string
+     * @return stream Id in UUID
+     */
+    public static UUID getStreamIdForStreamTag(String namespace, String streamTag) {
+        return CorfuRuntime.getStreamID(STREAM_TAG_PREFIX + namespace + streamTag);
+    }
+
+    /**
      * Adds the schema to the class map to enable serialization of this table data.
      *
      * @param msg Default message of this protobuf message.
@@ -273,9 +322,8 @@ public class TableRegistry {
     private <T extends Message> void addTypeToClassMap(T msg) {
         String typeUrl = getTypeUrl(msg.getDescriptorForType());
         // Register the schemas to schema table.
-        if (!classMap.containsKey(typeUrl)) {
-            classMap.put(typeUrl, msg.getClass());
-        }
+        ((ProtobufSerializer)Serializers.getSerializer(ProtobufSerializer.PROTOBUF_SERIALIZER_CODE))
+                .getClassMap().put(typeUrl, msg.getClass());
     }
 
     /**
@@ -328,15 +376,25 @@ public class TableRegistry {
                     protobufSerializer, this.runtime);
         }
 
+        List<String> streamTagsStringList = defaultValueMessage.getDescriptorForType()
+                .getOptions().getExtension(CorfuOptions.tableSchema).getStreamTagList();
+        Set<UUID> streamTagsUUIDSet = streamTagsStringList
+                .stream()
+                .map(tag -> getStreamIdForStreamTag(namespace, tag))
+                .collect(Collectors.toSet());
+
         // Open and return table instance.
-        Table<K, V, M> table = new Table<>(
-                namespace,
-                fullyQualifiedTableName,
+        Table<K, V, M> table = new Table<>(namespace, fullyQualifiedTableName,
+                kClass,
+                vClass,
+                mClass,
                 defaultValueMessage,
                 defaultMetadataMessage,
                 this.runtime,
                 this.protobufSerializer,
-                mapSupplier, versionPolicy);
+                mapSupplier,
+                versionPolicy,
+                streamTagsUUIDSet);
         tableMap.put(fullyQualifiedTableName, (Table<Message, Message, Message>) table);
 
         registerTable(namespace, tableName, kClass, vClass, mClass, tableOptions);
@@ -362,19 +420,18 @@ public class TableRegistry {
             // To do so, consult the TableRegistry for an entry which indicates the table exists.
             if (registryTable.containsKey(
                     TableName.newBuilder()
-                    .setNamespace(namespace)
-                    .setTableName(tableName)
-                    .build())
+                            .setNamespace(namespace)
+                            .setTableName(tableName)
+                            .build())
             ) {
                 // If table does exist then the caller must use the long form of the openTable()
                 // since there are too few arguments to open a table not seen by this runtime.
                 throw new IllegalArgumentException("Please provide Key, Value & Metadata schemas to re-open"
-                + " this existing table " + tableName + " in namespace " + namespace);
+                        + " this existing table " + tableName + " in namespace " + namespace);
             } else {
-                // If the table is completely unheard of return NoSuchElementException
-                throw new NoSuchElementException(
-                        String.format("No such table found: namespace: %s, tableName: %s",
-                        namespace, tableName));
+                // If the table is completely unheard of return NoSuchElementException.
+                throw new NoSuchElementException(String.format(
+                        "No such table found: namespace: %s, tableName: %s", namespace, tableName));
             }
         }
         return (Table<K, V, M>) tableMap.get(fullyQualifiedTableName);
@@ -417,6 +474,15 @@ public class TableRegistry {
     }
 
     /**
+     * Lists all tables.
+     *
+     * @return Collection of tables.
+     */
+    public Collection<TableName> listTables() {
+        return registryTable.keySet();
+    }
+
+    /**
      * Gets the table descriptors for a particular fully qualified table name.
      * This is used for reconstructing a message when the schema is not available.
      *
@@ -428,5 +494,38 @@ public class TableRegistry {
         return Optional.ofNullable(this.registryTable.get(tableName))
                 .map(CorfuRecord::getPayload)
                 .orElse(null);
+    }
+
+    /**
+     * Register a stream subscription manager. We want only one of these per runtime.
+     */
+    @Deprecated
+    public synchronized StreamManager getStreamManager() {
+        if (this.streamManager == null) {
+            this.streamManager = new StreamManager(runtime);
+        }
+        return this.streamManager;
+    }
+
+    /**
+     * Register a streaming subscription manager as a singleton.
+     */
+    public synchronized StreamingManager getStreamingManager() {
+        if (streamingManager == null) {
+            streamingManager = new StreamingManager(runtime);
+        }
+        return streamingManager;
+    }
+
+    /**
+     * Shutdown the table register, cleaning up relevant resources.
+     */
+    public void shutdown() {
+        if (streamManager != null) {
+            streamManager.shutdown();
+        }
+        if (streamingManager != null) {
+            streamingManager.shutdown();
+        }
     }
 }

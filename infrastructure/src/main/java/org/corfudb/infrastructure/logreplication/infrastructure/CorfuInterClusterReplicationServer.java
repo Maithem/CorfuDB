@@ -6,7 +6,7 @@ import ch.qos.logback.classic.LoggerContext;
 import ch.qos.logback.core.joran.spi.JoranException;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.infrastructure.ServerContext;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.CorfuReplicationClusterManagerAdapter;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.LogReplicationPluginConfig;
@@ -18,7 +18,9 @@ import org.slf4j.LoggerFactory;
 import java.io.File;
 import java.net.URL;
 import java.net.URLClassLoader;
+import java.time.Duration;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import static org.corfudb.util.NetworkUtils.getAddressFromInterfaceName;
@@ -45,20 +47,20 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "\n"
                     + "Usage:\n"
                     + "\tlog_replication_server (-l <path>|-m) [-nsN] [-a <address>|-q <interface-name>] "
-                    + "[--max-num-snapshot-msg-per-batch=<batch-size>] "
-                    + "[--max-data-message-size=<msg-size>] "
+                    + "[--snapshot-batch=<batch-size>] "
+                    + "[--max-replication-data-message-size=<msg-size>] "
                     + "[--lock-lease=<lease-duration>]"
                     + "[-c <ratio>] [-d <level>] [-p <seconds>] "
                     + "[--plugin=<plugin-config-file-path>]"
-                    + "[--layout-server-threads=<layout_server_threads>] [--base-server-threads=<base_server_threads>] "
+                    + "[--base-server-threads=<base_server_threads>] "
                     + "[--log-size-quota-percentage=<max_log_size_percentage>]"
                     + "[--logunit-threads=<logunit_threads>] [--management-server-threads=<management_server_threads>]"
                     + "[-e [-u <keystore> -f <keystore_password_file>] [-r <truststore> -w <truststore_password_file>] "
                     + "[-b] [-g -o <username_file> -j <password_file>] "
                     + "[-k <seqcache>] [-T <threads>] [-B <size>] [-i <channel-implementation>] "
                     + "[-H <seconds>] [-I <cluster-id>] [-x <ciphers>] [-z <tls-protocols>]] "
-                    + "[--metrics] [--metrics-port <metrics_port>]"
-                    + "[-P <prefix>] [-R <retention>] [--agent] <port>\n"
+                    + "[--metrics]"
+                    + "[-P <prefix>] [-R <retention>] <port>\n"
                     + "\n"
                     + "Options:\n"
                     + " -l <path>, --log-path=<path>                                             "
@@ -70,7 +72,7 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "              base64 format, or auto to randomly generate [default: auto].\n"
                     + " -T <threads>, --Threads=<threads>                                        "
                     + "              Number of corfu server worker threads, or 0 to use 2x the "
-                    + "              number of available processors [default: 0].\n"
+                    + "              number of available processors [default: 4].\n"
                     + " -P <prefix> --Prefix=<prefix>"
                     + "              The prefix to use for threads (useful for debugging multiple"
                     + "              servers) [default: ]."
@@ -152,31 +154,24 @@ public class CorfuInterClusterReplicationServer implements Runnable {
                     + "                                                                          "
                     + "              [default: TLSv1.1,TLSv1.2].\n"
                     + " --base-server-threads=<base_server_threads>                              "
-                    + "              Number of threads dedicated for the base server.\n          "
+                    + "              Number of threads dedicated for the base server [default: 1].\n"
                     + " --log-size-quota-percentage=<max_log_size_percentage>                    "
                     + "              The max size as percentage of underlying file-store size.\n "
                     + "              If this limit is exceeded "
                     + "              write requests will be rejected [default: 100.0].\n         "
                     + "                                                                          "
-                    + " --layout-server-threads=<layout_server_threads>                          "
-                    + "              Number of threads dedicated for the layout server.\n        "
-                    + "                                                                          "
                     + " --management-server-threads=<management_server_threads>                  "
-                    + "              Number of threads dedicated for the management server.\n"
+                    + "              Number of threads dedicated for the management server [default: 4].\n"
                     + "                                                                          "
                     + " --logunit-threads=<logunit_threads>                  "
-                    + "              Number of threads dedicated for the logunit server.\n"
-                    + "                                                                          "
-                    + " --agent      Run with byteman agent to enable runtime code injection.\n  "
+                    + "              Number of threads dedicated for the logunit server [default: 4].\n"
                     + " --metrics                                                                "
                     + "              Enable metrics provider.\n                                  "
-                    + " --metrics-port=<metrics_port>                                            "
-                    + "              Metrics provider server port [default: 9999].\n             "
                     + " --snapshot-batch=<batch-size>                                            "
                     + "              Snapshot (Full) Sync batch size.\n                          "
                     + "              The max number of messages per batch)\n                      "
                     + "                                                                          "
-                    + " --max-data-message-size=<msg-size>                                       "
+                    + " --max-replication-data-message-size=<msg-size>                                       "
                     + "              The max size of replication data message in bytes.\n   "
                     + "                                                                          "
                     + " --lock-lease=<lease-duration>                                            "
@@ -197,6 +192,10 @@ public class CorfuInterClusterReplicationServer implements Runnable {
 
     // Error code required to detect an ungraceful shutdown.
     private static final int EXIT_ERROR_CODE = 100;
+
+    private static final Duration DEFAULT_METRICS_LOGGING_INTERVAL_DURATION = Duration.ofMinutes(1);
+
+    private static final String DEFAULT_METRICS_LOGGER_NAME = "LogReplicationMetrics";
 
     // Getter for testing
     @Getter
@@ -238,6 +237,8 @@ public class CorfuInterClusterReplicationServer implements Runnable {
         log.info("Started with arguments: {}", opts);
 
         ServerContext serverContext = getServerContext(opts);
+
+        configureMetrics(opts, serverContext.getLocalEndpoint());
 
         // Register shutdown handler
         Thread shutdownThread = new Thread(this::cleanShutdown);
@@ -331,6 +332,20 @@ public class CorfuInterClusterReplicationServer implements Runnable {
         final Logger root = (Logger) LoggerFactory.getLogger(Logger.ROOT_LOGGER_NAME);
         final Level level = Level.toLevel(((String) opts.get("--log-level")).toUpperCase());
         root.setLevel(level);
+    }
+
+    public static void configureMetrics(Map<String, Object> opts, String localEndpoint) {
+        if ((boolean) opts.get("--metrics")) {
+            try {
+                LoggerContext context =  (LoggerContext) LoggerFactory.getILoggerFactory();
+                Optional.ofNullable(context.exists(DEFAULT_METRICS_LOGGER_NAME))
+                        .ifPresent(logger -> MeterRegistryProvider.MeterRegistryInitializer.init(logger,
+                                DEFAULT_METRICS_LOGGING_INTERVAL_DURATION, localEndpoint));
+            }
+            catch (IllegalStateException ise) {
+                log.warn("Registry has been previously initialized. Skipping.");
+            }
+        }
     }
 
     /**

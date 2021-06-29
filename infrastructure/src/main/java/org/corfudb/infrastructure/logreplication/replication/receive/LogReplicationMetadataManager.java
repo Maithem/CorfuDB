@@ -1,27 +1,41 @@
 package org.corfudb.infrastructure.logreplication.replication.receive;
 
+import com.google.protobuf.Message;
+import com.google.protobuf.Timestamp;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.LogReplicationMetadataKey;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.LogReplicationMetadataVal;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationEvent;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationEventKey;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusKey;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.ReplicationStatusVal;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.SnapshotSyncInfo;
+import org.corfudb.infrastructure.logreplication.proto.LogReplicationMetadata.SyncStatus;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata;
+import org.corfudb.runtime.LogReplication;
 import org.corfudb.runtime.collections.CorfuRecord;
 import org.corfudb.runtime.collections.CorfuStore;
 import org.corfudb.runtime.collections.CorfuStoreEntry;
 import org.corfudb.runtime.collections.QueryResult;
+import org.corfudb.runtime.collections.StreamListener;
 import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
+import org.corfudb.runtime.collections.TableSchema;
 import org.corfudb.runtime.collections.TxBuilder;
+import org.corfudb.runtime.proto.service.CorfuMessage;
+import org.corfudb.runtime.proto.service.CorfuMessage.HeaderMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponseMsg;
 import org.corfudb.runtime.view.Address;
 
+import java.time.Instant;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 
+import static org.corfudb.protocols.service.CorfuProtocolMessage.getResponseMsg;
 import static org.corfudb.runtime.view.TableRegistry.CORFU_SYSTEM_NAMESPACE;
 
 /**
@@ -31,22 +45,28 @@ import static org.corfudb.runtime.view.TableRegistry.CORFU_SYSTEM_NAMESPACE;
 @Slf4j
 public class LogReplicationMetadataManager {
 
-    private static final String NAMESPACE = CORFU_SYSTEM_NAMESPACE;
-    private static final String METADATA_TABLE_PREFIX_NAME = "CORFU-REPLICATION-WRITER-";
+    public static final String NAMESPACE = CORFU_SYSTEM_NAMESPACE;
+    public static final String METADATA_TABLE_PREFIX_NAME = "CORFU-REPLICATION-WRITER-";
     private static final String REPLICATION_STATUS_TABLE = "LogReplicationStatus";
+    private static final String REPLICATION_EVENT_TABLE_NAME = "LogReplicationEventTable";
 
-    private CorfuStore corfuStore;
+    private final CorfuStore corfuStore;
 
-    private String metadataTableName;
+    private final String metadataTableName;
 
-    private Table<ReplicationStatusKey, ReplicationStatusVal, ReplicationStatusVal> replicationStatusTable;
+    private final Table<ReplicationStatusKey, ReplicationStatusVal, ReplicationStatusVal> replicationStatusTable;
 
-    private CorfuRuntime runtime;
-    private String localClusterId;
+    private final CorfuRuntime runtime;
+    private final String localClusterId;
 
     public LogReplicationMetadataManager(CorfuRuntime rt, long topologyConfigId, String localClusterId) {
+
+        // LR does not require transaction logging enabled as we don't want to trigger subscriber's logic
+        // on replicated data which could eventually lead to overwrites
         this.runtime = rt;
+        // CorfuStore must have TX Logging Enabled as it might be used by consumers to update UI
         this.corfuStore = new CorfuStore(runtime);
+
         metadataTableName = getPersistedWriterMetadataTableName(localClusterId);
         try {
             this.corfuStore.openTable(NAMESPACE,
@@ -55,15 +75,24 @@ public class LogReplicationMetadataManager {
                             LogReplicationMetadataVal.class,
                             null,
                             TableOptions.builder().build());
-            replicationStatusTable = this.corfuStore.openTable(NAMESPACE,
+
+            this.replicationStatusTable = this.corfuStore.openTable(NAMESPACE,
                             REPLICATION_STATUS_TABLE,
                             ReplicationStatusKey.class,
                             ReplicationStatusVal.class,
                             null,
                             TableOptions.builder().build());
+
+            this.corfuStore.openTable(NAMESPACE,
+                    REPLICATION_EVENT_TABLE_NAME,
+                    ReplicationEventKey.class,
+                    ReplicationEvent.class,
+                    null,
+                    TableOptions.builder().build());
+
             this.localClusterId = localClusterId;
         } catch (Exception e) {
-            log.error("Caught an exception while opening MetadataManagerTables {}", e);
+            log.error("Caught an exception while opening MetadataManagerTables ", e);
             throw new ReplicationWriterException(e);
         }
         setupTopologyConfigId(topologyConfigId);
@@ -135,6 +164,20 @@ public class LogReplicationMetadataManager {
 
     public long getLastProcessedLogEntryTimestamp() {
         return query(null, LogReplicationMetadataType.LAST_LOG_ENTRY_PROCESSED);
+    }
+
+    public ResponseMsg getMetadataResponse(HeaderMsg header) {
+        LogReplication.LogReplicationMetadataResponseMsg metadataMsg = LogReplication.LogReplicationMetadataResponseMsg
+                .newBuilder()
+                .setTopologyConfigID(getTopologyConfigId())
+                .setVersion(getVersion())
+                .setSnapshotStart(getLastStartedSnapshotTimestamp())
+                .setSnapshotTransferred(getLastTransferredSnapshotTimestamp())
+                .setSnapshotApplied(getLastAppliedSnapshotTimestamp())
+                .setLastLogEntryTimestamp(getLastProcessedLogEntryTimestamp()).build();
+        CorfuMessage.ResponsePayloadMsg payload = CorfuMessage.ResponsePayloadMsg.newBuilder()
+                .setLrMetadataResponse(metadataMsg).build();
+        return getResponseMsg(header, payload);
     }
 
     public void appendUpdate(TxBuilder txBuilder, LogReplicationMetadataType type, long val) {
@@ -221,16 +264,16 @@ public class LogReplicationMetadataManager {
     public boolean setBaseSnapshotStart(long topologyConfigId, long ts) {
         CorfuStoreMetadata.Timestamp timestamp = corfuStore.getTimestamp();
         long persistedTopologyConfigID = query(timestamp, LogReplicationMetadataType.TOPOLOGY_CONFIG_ID);
-        long persistSnapStart = query(timestamp, LogReplicationMetadataType.LAST_SNAPSHOT_STARTED);
+        long persistedSnapshotStart = query(timestamp, LogReplicationMetadataType.LAST_SNAPSHOT_STARTED);
 
         log.debug("Set snapshotStart topologyConfigId={}, ts={}, persistedTopologyConfigID={}, persistedSnapshotStart={}",
-                topologyConfigId, ts, persistedTopologyConfigID, persistSnapStart);
+                topologyConfigId, ts, persistedTopologyConfigID, persistedSnapshotStart);
 
         // It means the cluster config has changed, ignore the update operation.
-        if (topologyConfigId != persistedTopologyConfigID || ts <= persistedTopologyConfigID) {
-            log.warn("The metadata is older than the persisted one. Set snapshotStart topologyConfigId={}, ts={}," +
-                    " persistedTopologyConfigId={}, persistedSnapshotStart={}", topologyConfigId, ts,
-                    persistedTopologyConfigID, persistSnapStart);
+        if (topologyConfigId != persistedTopologyConfigID) {
+            log.warn("Config differs between sender and receiver, sender[topologyConfigId={}, ts={}]" +
+                    " receiver[persistedTopologyConfigId={}, persistedSnapshotStart={}]", topologyConfigId, ts,
+                    persistedTopologyConfigID, persistedSnapshotStart);
             return false;
         }
 
@@ -252,7 +295,7 @@ public class LogReplicationMetadataManager {
 
         log.debug("Commit. Set snapshotStart topologyConfigId={}, ts={}, persistedTopologyConfigID={}, " +
                         "persistedSnapshotStart={}",
-                topologyConfigId, ts, persistedTopologyConfigID, persistSnapStart);
+                topologyConfigId, ts, persistedTopologyConfigID, persistedSnapshotStart);
 
         return (ts == getLastStartedSnapshotTimestamp() && topologyConfigId == getTopologyConfigId());
     }
@@ -292,12 +335,12 @@ public class LogReplicationMetadataManager {
         log.debug("Commit snapshot transfer complete timestamp={}, for topologyConfigId={}", ts, topologyConfigId);
     }
 
-    public void setSnapshotAppliedComplete(LogReplicationEntry entry) {
+    public void setSnapshotAppliedComplete(LogReplication.LogReplicationEntryMsg entry) {
         CorfuStoreMetadata.Timestamp timestamp = corfuStore.getTimestamp();
         long persistedTopologyConfigId = query(timestamp, LogReplicationMetadataType.TOPOLOGY_CONFIG_ID);
         long persistedSnapshotStart = query(timestamp, LogReplicationMetadataType.LAST_SNAPSHOT_STARTED);
         long persistedSnapshotTransferComplete = query(timestamp, LogReplicationMetadataType.LAST_SNAPSHOT_TRANSFERRED);
-        long topologyConfigId = entry.getMetadata().getTopologyConfigId();
+        long topologyConfigId = entry.getMetadata().getTopologyConfigID();
         long ts = entry.getMetadata().getSnapshotTimestamp();
 
         if (topologyConfigId != persistedTopologyConfigId || ts != persistedSnapshotStart
@@ -317,17 +360,190 @@ public class LogReplicationMetadataManager {
         log.debug("Commit snapshot apply complete timestamp={}, for topologyConfigId={}", ts, topologyConfigId);
     }
 
-    public void setReplicationRemainingEntries(String clusterId, long remainingEntries,
-                                               ReplicationStatusVal.SyncType type) {
+    /**
+     * Update replication status table's snapshot sync info as ongoing.
+     *
+     * Note: TransactionAbortedException has been handled by upper level.
+     *
+     * @param clusterId standby cluster id
+     */
+    public void updateSnapshotSyncInfo(String clusterId, boolean forced, UUID eventId,
+                                       long baseVersion, long remainingEntries) {
         ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(clusterId).build();
-        ReplicationStatusVal val = ReplicationStatusVal.newBuilder().setRemainingEntriesToSend(remainingEntries)
-                .setType(type).build();
-        TxBuilder txBuilder = corfuStore.tx(NAMESPACE);
-        txBuilder.update(REPLICATION_STATUS_TABLE, key, val, null);
-        txBuilder.commit();
 
-        log.trace("setReplicationRemainingEntries: clusterId: {}, remainingEntries: {}, type: {}",
-                clusterId, remainingEntries, type);
+        SnapshotSyncInfo.SnapshotSyncType syncType = forced ?
+                SnapshotSyncInfo.SnapshotSyncType.FORCED :
+                SnapshotSyncInfo.SnapshotSyncType.DEFAULT;
+
+        SnapshotSyncInfo syncInfo = SnapshotSyncInfo.newBuilder()
+                .setType(syncType)
+                .setStatus(SyncStatus.ONGOING)
+                .setSnapshotRequestId(eventId.toString())
+                .setBaseSnapshot(baseVersion)
+                .build();
+
+        ReplicationStatusVal status = ReplicationStatusVal.newBuilder()
+                .setRemainingEntriesToSend(remainingEntries)
+                .setSyncType(ReplicationStatusVal.SyncType.SNAPSHOT)
+                .setStatus(SyncStatus.ONGOING)
+                .setSnapshotSyncInfo(syncInfo)
+                .build();
+
+        corfuStore.tx(NAMESPACE)
+                .update(REPLICATION_STATUS_TABLE, key, status, null)
+                .commit();
+
+        log.debug("updateSnapshotSyncInfo as ongoing: clusterId: {}, syncInfo: {}",
+                clusterId, syncInfo);
+    }
+
+    /**
+     * Update replication status table's snapshot sync info as completed.
+     *
+     * Note: TransactionAbortedException has been handled by upper level.
+     *
+     * @param clusterId standby cluster id
+     */
+    public void updateSnapshotSyncInfo(String clusterId) {
+        Instant time = Instant.now();
+
+        Timestamp timestamp = Timestamp.newBuilder().setSeconds(time.getEpochSecond())
+                .setNanos(time.getNano()).build();
+
+        ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(clusterId).build();
+        CorfuRecord<ReplicationStatusVal, Message> record =
+                corfuStore.query(NAMESPACE).getRecord(REPLICATION_STATUS_TABLE, key);
+        if (record != null) {
+            ReplicationStatusVal previous = record.getPayload();
+            SnapshotSyncInfo previousSyncInfo = previous.getSnapshotSyncInfo();
+
+            SnapshotSyncInfo currentSyncInfo = previousSyncInfo.toBuilder()
+                    .setStatus(SyncStatus.COMPLETED)
+                    .setCompletedTime(timestamp)
+                    .build();
+
+            ReplicationStatusVal current = ReplicationStatusVal.newBuilder()
+                    .setRemainingEntriesToSend(previous.getRemainingEntriesToSend())
+                    .setSyncType(ReplicationStatusVal.SyncType.LOG_ENTRY)
+                    .setStatus(SyncStatus.ONGOING)
+                    .setSnapshotSyncInfo(currentSyncInfo)
+                    .build();
+
+            corfuStore.tx(NAMESPACE)
+                    .update(REPLICATION_STATUS_TABLE, key, current, null)
+                    .commit();
+
+            log.debug("updateSnapshotSyncInfo as completed: clusterId: {}, syncInfo: {}",
+                    clusterId, currentSyncInfo);
+        }
+    }
+
+    /**
+     * Update replication status table's sync status
+     *
+     * Note: TransactionAbortedException has been handled by upper level.
+     *
+     * @param clusterId standby cluster id
+     */
+    public void updateSyncStatus(String clusterId, ReplicationStatusVal.SyncType lastSyncType, SyncStatus status) {
+        ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(clusterId).build();
+
+        CorfuRecord<ReplicationStatusVal, Message> record =
+                corfuStore.query(NAMESPACE).getRecord(REPLICATION_STATUS_TABLE, key);
+
+        ReplicationStatusVal previous;
+        if (record != null) {
+            previous = record.getPayload();
+        } else {
+            previous = ReplicationStatusVal.newBuilder().build();
+        }
+
+        ReplicationStatusVal current;
+        if (lastSyncType.equals(ReplicationStatusVal.SyncType.LOG_ENTRY)) {
+            current = previous.toBuilder().setStatus(status).build();
+        } else {
+            SnapshotSyncInfo syncInfo = previous.getSnapshotSyncInfo();
+            syncInfo = syncInfo.toBuilder().setStatus(status).build();
+            current = previous.toBuilder().setStatus(status).setSnapshotSyncInfo(syncInfo).build();
+        }
+
+        corfuStore.tx(NAMESPACE)
+                .update(REPLICATION_STATUS_TABLE, key, current, null)
+                .commit();
+
+        log.debug("updateSyncStatus: clusterId: {}, type: {}, status: {}",
+                clusterId, lastSyncType, status);
+    }
+
+    /**
+     * Set replication status table.
+     * If the current sync type is log entry sync, keep Snapshot Sync Info.
+     *
+     * Note: TransactionAbortedException has been handled by upper level.
+     *
+     * @param clusterId standby cluster id
+     * @param remainingEntries num of remaining entries to send
+     * @param type sync type
+     */
+    public void setReplicationStatusTable(String clusterId, long remainingEntries,
+                                          ReplicationStatusVal.SyncType type) {
+        ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(clusterId).build();
+        SnapshotSyncInfo syncInfo = null;
+        ReplicationStatusVal current;
+
+        CorfuRecord<ReplicationStatusVal, Message> record =
+                corfuStore.query(NAMESPACE).getRecord(REPLICATION_STATUS_TABLE, key);
+        if (record != null) {
+            ReplicationStatusVal previous = record.getPayload();
+            syncInfo = previous.getSnapshotSyncInfo();
+        }
+
+        if (type == ReplicationStatusVal.SyncType.LOG_ENTRY) {
+            if (syncInfo == null){
+                log.warn("setReplicationStatusTable during LOG_ENTRY sync, " +
+                        "previous status is not present for cluster: {}", clusterId);
+                syncInfo = SnapshotSyncInfo.newBuilder().build();
+            }
+
+            current = ReplicationStatusVal.newBuilder()
+                    .setRemainingEntriesToSend(remainingEntries)
+                    .setSyncType(type)
+                    .setStatus(SyncStatus.ONGOING)
+                    .setSnapshotSyncInfo(syncInfo)
+                    .build();
+
+            corfuStore.tx(NAMESPACE)
+                    .update(REPLICATION_STATUS_TABLE, key, current, null)
+                    .commit();
+
+            log.debug("setReplicationStatusTable: clusterId: {}, remainingEntries: {}, type: {}, syncInfo: {}",
+                    clusterId, remainingEntries, type, syncInfo);
+        } else if (type == ReplicationStatusVal.SyncType.SNAPSHOT) {
+            SnapshotSyncInfo currentSyncInfo;
+            if (syncInfo == null){
+                log.warn("setReplicationStatusTable during SNAPSHOT sync, " +
+                        "previous status is not present for cluster: {}", clusterId);
+                currentSyncInfo = SnapshotSyncInfo.newBuilder().build();
+            } else {
+                currentSyncInfo = syncInfo.toBuilder()
+                        .setStatus(SyncStatus.ONGOING)
+                        .build();
+            }
+
+            current = ReplicationStatusVal.newBuilder()
+                    .setRemainingEntriesToSend(remainingEntries)
+                    .setSyncType(type)
+                    .setStatus(SyncStatus.ONGOING)
+                    .setSnapshotSyncInfo(currentSyncInfo)
+                    .build();
+
+            corfuStore.tx(NAMESPACE)
+                    .update(REPLICATION_STATUS_TABLE, key, current, null)
+                    .commit();
+
+            log.debug("setReplicationStatusTable: clusterId: {}, remainingEntries: {}, type: {}, syncInfo: {}",
+                    clusterId, remainingEntries, type, currentSyncInfo);
+        }
     }
 
     public Map<String, ReplicationStatusVal> getReplicationRemainingEntries() {
@@ -336,7 +552,12 @@ public class LogReplicationMetadataManager {
                 corfuStore.query(NAMESPACE).executeQuery(REPLICATION_STATUS_TABLE, record -> true);
 
         for(CorfuStoreEntry<ReplicationStatusKey, ReplicationStatusVal, ReplicationStatusVal>entry : entries.getResult()) {
-            replicationStatusMap.put(entry.getKey().getClusterId(), entry.getPayload());
+            String clusterId = entry.getKey().getClusterId();
+            ReplicationStatusVal value = entry.getPayload();
+            replicationStatusMap.put(clusterId, value);
+            log.debug("getReplicationRemainingEntries: clusterId={}, remainingEntriesToSend={}, " +
+                    "syncType={}, is_consistent={}", clusterId, value.getRemainingEntriesToSend(),
+                    value.getSyncType(), value.getDataConsistent());
         }
 
         log.debug("getReplicationRemainingEntries: replicationStatusMap size: {}", replicationStatusMap.size());
@@ -344,23 +565,26 @@ public class LogReplicationMetadataManager {
         return replicationStatusMap;
     }
 
-    public ReplicationStatusVal getReplicationRemainingEntries(String clusterId) {
-        ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(clusterId).build();
-        CorfuRecord record = corfuStore.query(NAMESPACE).getRecord(REPLICATION_STATUS_TABLE, key);
-        if (record == null) {
-            return null;
-        }
-        return (ReplicationStatusVal)record.getPayload();
-    }
-
+    /**
+     * set DataConsistent filed in status table on standby side.
+     *
+     * Note: TransactionAbortedException has been handled by upper level.
+     *
+     * @param isConsistent data is consistent or not
+     */
     public void setDataConsistentOnStandby(boolean isConsistent) {
         ReplicationStatusKey key = ReplicationStatusKey.newBuilder().setClusterId(localClusterId).build();
-        ReplicationStatusVal val = ReplicationStatusVal.newBuilder().setDataConsistent(isConsistent).build();
+        ReplicationStatusVal val = ReplicationStatusVal.newBuilder()
+                .setDataConsistent(isConsistent)
+                .setStatus(SyncStatus.UNAVAILABLE)
+                .build();
         TxBuilder txBuilder = corfuStore.tx(NAMESPACE);
         txBuilder.update(REPLICATION_STATUS_TABLE, key, val, null);
         txBuilder.commit();
 
-        log.trace("setDataConsistentOnStandby: localClusterId: {}, isConsistent: {}", localClusterId, isConsistent);
+        if (log.isTraceEnabled()) {
+            log.trace("setDataConsistentOnStandby: localClusterId: {}, isConsistent: {}", localClusterId, isConsistent);
+        }
     }
 
     public Map<String, ReplicationStatusVal> getDataConsistentOnStandby() {
@@ -384,6 +608,7 @@ public class LogReplicationMetadataManager {
     }
 
     public void resetReplicationStatus() {
+        log.info("Reset replication status");
         replicationStatusTable.clear();
     }
 
@@ -467,6 +692,40 @@ public class LogReplicationMetadataManager {
         return query(null, LogReplicationMetadataType.CURRENT_SNAPSHOT_CYCLE_ID);
     }
 
+    /**
+     * Interface to write an event to the logReplicationEventTable.
+     * @param key
+     * @param event
+     */
+    public void updateLogReplicationEventTable(ReplicationEventKey key, ReplicationEvent event) {
+        log.info("UpdateReplicationEvent {} with event {}", REPLICATION_EVENT_TABLE_NAME, event);
+        TxBuilder txBuilder = corfuStore.tx(NAMESPACE);
+        txBuilder.update(REPLICATION_EVENT_TABLE_NAME, key, event, null);
+        txBuilder.commit();
+    }
+
+    /**
+     * Subscribe to the logReplicationEventTable
+     * @param listener
+     */
+    public void subscribeReplicationEventTable(StreamListener listener) {
+        log.info("LogReplication start listener for table {}", REPLICATION_EVENT_TABLE_NAME);
+        corfuStore.subscribe(listener, NAMESPACE,
+                Collections.singletonList(new TableSchema(REPLICATION_EVENT_TABLE_NAME, ReplicationEventKey.class, ReplicationEvent.class, null)), null);
+    }
+
+    /**
+     * Unsubscribe the logReplicationEventTable
+     * @param listener
+     */
+    public void unsubscribeReplicationEventTable(StreamListener listener) {
+        corfuStore.unsubscribe(listener);
+    }
+
+    public void shutdown() {
+        // No-Op
+    }
+
     public enum LogReplicationMetadataType {
         TOPOLOGY_CONFIG_ID("topologyConfigId"),
         VERSION("version"),
@@ -478,7 +737,9 @@ public class LogReplicationMetadataManager {
         CURRENT_CYCLE_MIN_SHADOW_STREAM_TS("minShadowStreamTimestamp"),
         LAST_LOG_ENTRY_PROCESSED("lastLogEntryProcessed"),
         REMAINING_REPLICATION_PERCENT("replicationStatus"),
-        DATA_CONSISTENT_ON_STANDBY("dataConsistentOnStandby");
+        DATA_CONSISTENT_ON_STANDBY("dataConsistentOnStandby"),
+        SNAPSHOT_SYNC_TYPE("snapshotSyncType"),
+        SNAPSHOT_SYNC_COMPLETE_TIME("snapshotSyncCompleteTime");
 
         @Getter
         String val;

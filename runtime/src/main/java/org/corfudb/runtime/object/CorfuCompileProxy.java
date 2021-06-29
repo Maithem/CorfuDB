@@ -1,12 +1,9 @@
 package org.corfudb.runtime.object;
 
-import static java.lang.Long.min;
-
-import com.codahale.metrics.Counter;
-import com.codahale.metrics.MetricRegistry;
-import com.codahale.metrics.Timer;
+import io.micrometer.core.instrument.Timer;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.protocols.logprotocol.SMREntry;
 import org.corfudb.protocols.wireprotocol.Token;
 import org.corfudb.protocols.wireprotocol.TokenResponse;
@@ -20,8 +17,6 @@ import org.corfudb.runtime.exceptions.TrimmedUpcallException;
 import org.corfudb.runtime.object.transactions.AbstractTransactionalContext;
 import org.corfudb.runtime.object.transactions.TransactionalContext;
 import org.corfudb.runtime.view.Address;
-import org.corfudb.util.CorfuComponent;
-import org.corfudb.util.MetricsUtils;
 import org.corfudb.util.ReflectionUtils;
 import org.corfudb.util.Sleep;
 import org.corfudb.util.Utils;
@@ -31,9 +26,14 @@ import org.slf4j.LoggerFactory;
 
 import java.lang.reflect.InvocationTargetException;
 import java.time.Duration;
+import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import java.util.function.Supplier;
+
+import static java.lang.Long.min;
 
 /**
  * In the Corfu runtime, on top of a stream,
@@ -95,6 +95,12 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
     ISerializer serializer;
 
     /**
+     * Stream tags for streaming transactional updates
+     */
+    @Getter
+    Set<UUID> streamTags;
+
+    /**
      * The arguments this proxy was created with.
      */
     private final Object[] args;
@@ -102,14 +108,9 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
     /**
      * Metrics: meter (counter), histogram.
      */
-    private final Timer timerAccess;
-    private final Timer timerAccessPerStream;
-    private final Timer timerLogWrite;
-    private final Timer timerTxn;
-    private final Timer timerUpcall;
-    private final Counter counterTxnRetry1;
-    private final Counter counterTxnRetryN;
-
+    private final Optional<Timer> readTimer;
+    private final Optional<Timer> writeTimer;
+    private final Optional<Timer> txTimer;
     /**
      * Correctness Logging
      */
@@ -123,17 +124,18 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
      * @param type                Type of underlying object to instantiate a new instance.
      * @param args                Arguments to create this proxy.
      * @param serializer          Serializer used by the SMR entries to serialize the arguments.
+     * @param streamTags          Tags applied to the stream
+     * @param wrapperObject       The wrapped object
      */
-    @Deprecated // TODO: Add replacement method that conforms to style
     @SuppressWarnings("checkstyle:abbreviation") // Due to deprecation
-    public CorfuCompileProxy(CorfuRuntime rt, UUID streamID, Class<T> type, Object[] args,
-                             ISerializer serializer, ICorfuSMR<T> wrapperObject
-    ) {
+    CorfuCompileProxy(CorfuRuntime rt, UUID streamID, Class<T> type, Object[] args,
+                      ISerializer serializer, Set<UUID> streamTags, ICorfuSMR<T> wrapperObject) {
         this.rt = rt;
         this.streamID = streamID;
         this.type = type;
         this.args = args;
         this.serializer = serializer;
+        this.streamTags = streamTags;
 
         // Since the VLO is thread safe we don't need to use a thread safe stream implementation
         // because the VLO will control access to the stream
@@ -141,14 +143,28 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
                 new StreamViewSMRAdapter(rt, rt.getStreamsView().getUnsafe(streamID)),
                 wrapperObject);
 
-        final MetricRegistry metrics = CorfuRuntime.getDefaultMetrics();
-        timerAccess = metrics.timer(CorfuComponent.OBJECT + "access");
-        timerAccessPerStream = metrics.timer(CorfuComponent.OBJECT + "access-" + streamID);
-        timerLogWrite = metrics.timer(CorfuComponent.OBJECT + "log-write");
-        timerTxn = metrics.timer(CorfuComponent.OBJECT + "txn");
-        timerUpcall = metrics.timer(CorfuComponent.OBJECT + "upcall");
-        counterTxnRetry1 = metrics.counter(CorfuComponent.OBJECT + "txn-first-retry");
-        counterTxnRetryN = metrics.counter(CorfuComponent.OBJECT + "txn-extra-retries");
+        String streamIdKey = "streamId";
+        String streamIdValue = getStreamID().toString();
+
+        double [] percentiles = new double [] {0.50, 0.95, 0.99};
+        readTimer = MeterRegistryProvider.getInstance().map(registry ->
+                Timer.builder("vlo.read.timer")
+                        .tag(streamIdKey, streamIdValue)
+                        .publishPercentileHistogram(true)
+                        .publishPercentiles(percentiles)
+                        .register(registry));
+        writeTimer = MeterRegistryProvider.getInstance().map(registry ->
+                Timer.builder("vlo.write.timer")
+                        .tag(streamIdKey, streamIdValue)
+                        .publishPercentileHistogram(true)
+                        .publishPercentiles(percentiles)
+                        .register(registry));
+        txTimer = MeterRegistryProvider.getInstance().map(registry ->
+                Timer.builder("vlo.tx.timer")
+                        .tag(streamIdKey, streamIdValue)
+                        .publishPercentileHistogram(true)
+                        .publishPercentiles(percentiles)
+                        .register(registry));
     }
 
     /**
@@ -165,10 +181,11 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
     @Override
     public <R> R access(ICorfuSMRAccess<R, T> accessMethod,
                         Object[] conflictObject) {
-        try (Timer.Context context = MetricsUtils.getConditionalContext(timerAccess)) {
-            try (Timer.Context streamContext = MetricsUtils.getConditionalContext(timerAccessPerStream)) {
-                return accessInner(accessMethod, conflictObject);
-            }
+        if (readTimer.isPresent()) {
+            return readTimer.get().record(() -> accessInner(accessMethod, conflictObject));
+        }
+        else {
+            return accessInner(accessMethod, conflictObject);
         }
     }
 
@@ -184,31 +201,35 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
             }
         }
 
+        // Linearize this read against a timestamp
+        AtomicLong timestamp = new AtomicLong(rt.getSequencerView().query(getStreamID()));
+
+        log.debug("Access[{}] conflictObj={} version={}", this, conflictObject, timestamp);
+
         // Perform underlying access
-        for (int x = 0; x < rt.getParameters().getTrimRetry(); x++) {
-            // Linearize this read against a timestamp
-            final long timestamp = rt.getSequencerView()
-                            .query(getStreamID());
-            log.debug("Access[{}] conflictObj={} version={}", this, conflictObject, timestamp);
+        return underlyingObject.access(o -> o.getVersionUnsafe() >= timestamp.get()
+                        && !o.isOptimisticallyModifiedUnsafe(),
+                o -> {
+                    for (int x = 0; x < rt.getParameters().getTrimRetry(); x++) {
+                        try {
+                            o.syncObjectUnsafe(timestamp.get());
+                            break;
+                        } catch (TrimmedException te) {
+                            log.info("accessInner: Encountered trimmed address space " +
+                                            "while accessing version {} of stream {} on attempt {}",
+                                    timestamp.get(), getStreamID(), x);
 
-            try {
-                return underlyingObject.access(o -> o.getVersionUnsafe() >= timestamp
-                                && !o.isOptimisticallyModifiedUnsafe(),
-                        o -> o.syncObjectUnsafe(timestamp),
-                        o -> accessMethod.access(o));
-            } catch (TrimmedException te) {
-                log.info("accessInner: Encountered trimmed address space " +
-                    "while accessing version {} of stream {} on attempt {}",
-                    timestamp, getStreamID(), x);
-                // We encountered a TRIM during sync, reset the object
-                underlyingObject.update(o -> {
-                    o.resetUnsafe();
-                    return null;
-                });
-            }
-        }
+                            o.resetUnsafe();
 
-        throw new TrimmedException();
+                            if (x == (rt.getParameters().getTrimRetry() - 1)) {
+                                throw te;
+                            }
+
+                            timestamp.set(rt.getSequencerView().query(getStreamID()));
+                        }
+                    }
+                },
+                o -> accessMethod.access(o));
     }
 
     /**
@@ -217,7 +238,10 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
     @Override
     public long logUpdate(String smrUpdateFunction, final boolean keepUpcallResult,
                           Object[] conflictObject, Object... args) {
-        try (Timer.Context context = MetricsUtils.getConditionalContext(timerLogWrite)) {
+        if (writeTimer.isPresent()) {
+            return writeTimer.get().record(() -> logUpdateInner(smrUpdateFunction, keepUpcallResult, conflictObject, args));
+        }
+        else {
             return logUpdateInner(smrUpdateFunction, keepUpcallResult, conflictObject, args);
         }
     }
@@ -253,9 +277,7 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
      */
     @Override
     public <R> R getUpcallResult(long timestamp, Object[] conflictObject) {
-        try (Timer.Context context = MetricsUtils.getConditionalContext(timerUpcall);) {
-            return getUpcallResultInner(timestamp, conflictObject);
-        }
+        return getUpcallResultInner(timestamp, conflictObject);
     }
 
     private <R> R getUpcallResultInner(long timestamp, Object[] conflictObject) {
@@ -280,9 +302,9 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
             return ret == VersionLockedObject.NullValue.NULL_VALUE ? null : ret;
         }
 
-        for (int x = 0; x < rt.getParameters().getTrimRetry(); x++) {
-            try {
-                return underlyingObject.update(o -> {
+        return underlyingObject.update(o -> {
+            for (int x = 0; x < rt.getParameters().getTrimRetry(); x++) {
+                try {
                     o.syncObjectUnsafe(timestamp);
                     if (o.getUpcallResults().containsKey(timestamp)) {
                         log.trace("Upcall[{}] {} Sync'd", this, timestamp);
@@ -299,20 +321,17 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
                             + "of an upcall@" + timestamp + " but we are @"
                             + underlyingObject.getVersionUnsafe()
                             + " and we don't have a copy");
-                });
-            } catch (TrimmedException ex) {
-                log.info("getUpcallResultInner: Encountered trimmed address space " +
-                    "while accessing version {} of stream {} on attempt {}",
-                    timestamp, getStreamID(), x);
-                // We encountered a TRIM during sync, reset the object
-                underlyingObject.update(o -> {
+                } catch (TrimmedException ex) {
+                    log.info("getUpcallResultInner: Encountered trimmed address space " +
+                                    "while accessing version {} of stream {} on attempt {}",
+                            timestamp, getStreamID(), x);
+                    // We encountered a TRIM during sync, reset the object
                     o.resetUnsafe();
-                    return null;
-                });
+                }
             }
-        }
 
-        throw new TrimmedUpcallException(timestamp);
+            throw new TrimmedUpcallException(timestamp);
+        });
     }
 
     /**
@@ -333,7 +352,10 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
      */
     @Override
     public <R> R TXExecute(Supplier<R> txFunction) {
-        try (Timer.Context context = MetricsUtils.getConditionalContext(timerTxn)) {
+        if (txTimer.isPresent()) {
+            return txTimer.get().record(() -> TXExecuteInner(txFunction));
+        }
+        else {
             return TXExecuteInner(txFunction);
         }
     }
@@ -364,19 +386,11 @@ public class CorfuCompileProxy<T extends ICorfuSMR<T>> implements ICorfuSMRProxy
                 // If this is part of an outer transaction abort and remove from context.
                 // Re-throw exception to client.
                 log.warn("TXExecute[{}] Abort with exception {}", this, e);
-                if (e.getAbortCause() == AbortCause.NETWORK) {
-                    if (TransactionalContext.getCurrentContext() != null) {
-                        TransactionalContext.getCurrentContext().abortTransaction(e);
-                        TransactionalContext.removeContext();
-                        throw e;
-                    }
+                if (e.getAbortCause() == AbortCause.NETWORK && TransactionalContext.getCurrentContext() != null) {
+                    TransactionalContext.getCurrentContext().abortTransaction(e);
+                    TransactionalContext.removeContext();
+                    throw e;
                 }
-
-                if (retries == 1) {
-                    MetricsUtils
-                            .incConditionalCounter(counterTxnRetry1, 1);
-                }
-                MetricsUtils.incConditionalCounter(counterTxnRetryN, 1);
                 log.debug("Transactional function aborted due to {}, retrying after {} msec",
                         e, sleepTime);
                 Sleep.sleepUninterruptibly(Duration.ofMillis(sleepTime));

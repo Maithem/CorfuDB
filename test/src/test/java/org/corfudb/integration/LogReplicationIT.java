@@ -34,10 +34,10 @@ import org.corfudb.infrastructure.logreplication.replication.fsm.ObservableAckMs
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
 import org.corfudb.infrastructure.logreplication.replication.send.LogReplicationEventMetadata;
 import org.corfudb.protocols.wireprotocol.Token;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationMetadataResponse;
-import org.corfudb.protocols.wireprotocol.logreplication.MessageType;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryType;
+import org.corfudb.runtime.LogReplication.LogReplicationMetadataResponseMsg;
 import org.corfudb.runtime.collections.CorfuTable;
 import org.corfudb.runtime.view.ObjectsView;
 import org.corfudb.util.Utils;
@@ -128,7 +128,7 @@ public class LogReplicationIT extends AbstractIT implements Observer {
     private ObservableAckMsg ackMessages;
 
     // An observable value on the metadata response (received by the source)
-    private ObservableValue<LogReplicationMetadataResponse> metadataResponseObservable;
+    private ObservableValue<LogReplicationMetadataResponseMsg> metadataResponseObservable;
 
     // An observable value on the number of errors received on Log Entry Sync (source side)
     private ObservableValue errorsLogEntrySync;
@@ -150,7 +150,7 @@ public class LogReplicationIT extends AbstractIT implements Observer {
     // Set per test according to the expected number
     private int expectedSinkReceivedMessages = 0;
 
-    private MessageType expectedAckMsgType = MessageType.SNAPSHOT_TRANSFER_COMPLETE;
+    private LogReplicationEntryType expectedAckMsgType = LogReplicationEntryType.SNAPSHOT_TRANSFER_COMPLETE;
 
     /* ********* Semaphore to block until expected values are reached ********** */
 
@@ -396,7 +396,6 @@ public class LogReplicationIT extends AbstractIT implements Observer {
      */
     @Test
     public void testValidSnapshotSyncCrossTables() throws Exception {
-
         // Write data in transaction to t0 and t1
         Set<String> crossTables = new HashSet<>();
         crossTables.add(t0);
@@ -487,20 +486,6 @@ public class LogReplicationIT extends AbstractIT implements Observer {
 
         // Open Streams on Source
         openStreams(srcCorfuTables, srcDataRuntime, NUM_STREAMS);
-
-        // Open a dump table
-        CorfuTable<Long, Long> dumpDataTable = srcDataRuntime.getObjectsView()
-                .build()
-                .setStreamName("dumpData")
-                .setTypeToken(new TypeToken<CorfuTable<Long, Long>>() {
-                })
-                .setSerializer(Serializers.PRIMITIVE)
-                .open();
-
-        // Generate some dump data to enforce an empty snapshot transfer
-        for (long i = 0; i < NUM_KEYS; i++) {
-            dumpDataTable.put(i, i);
-        }
 
         // Verify no data on source
         log.debug("****** Verify No Data in Source Site");
@@ -1232,6 +1217,7 @@ public class LogReplicationIT extends AbstractIT implements Observer {
                                 .replicationConfig(config).localCorfuEndpoint(SOURCE_ENDPOINT).build(),
                 logReplicationMetadataManager,
                 sourceDataSender);
+        logReplicationSourceManager.getLogReplicationFSM().getAckReader().getOngoing().set(false);
 
         // Set Log Replication Source Manager so we can emulate the channel for data & control messages (required
         // for testing)
@@ -1300,7 +1286,7 @@ public class LogReplicationIT extends AbstractIT implements Observer {
         }
     }
 
-    private void verifyMetadataResponse(LogReplicationMetadataResponse response) {
+    private void verifyMetadataResponse(LogReplicationMetadataResponseMsg response) {
         if (response.getSnapshotTransferred() == response.getSnapshotApplied()) {
             log.debug("Metadata response indicates snapshot sync apply has completed");
             blockUntilExpectedMetadataResponse.release();
@@ -1311,30 +1297,28 @@ public class LogReplicationIT extends AbstractIT implements Observer {
 
     private void verifyExpectedValue(long expectedValue, long currentValue) {
         // If expected value, release semaphore / unblock the wait
-        if (expectedValue == currentValue) {
-            if (expectedAckMsgType != null) {
-                blockUntilExpectedValueReached.release();
-            }
+        if (expectedValue == currentValue && expectedAckMsgType != null) {
+            blockUntilExpectedValueReached.release();
         }
     }
 
     private void verifyExpectedAckMessage(ObservableAckMsg observableAckMsg) {
         // If expected a ackTs, release semaphore / unblock the wait
         if (observableAckMsg.getDataMessage() != null) {
-            LogReplicationEntry logReplicationEntry = observableAckMsg.getDataMessage();
+            LogReplicationEntryMsg logReplicationEntry = observableAckMsg.getDataMessage();
 
             switch (testConfig.waitOn) {
                 case ON_ACK:
                     verifyExpectedValue(expectedAckMessages, ackMessages.getMsgCnt());
                 case ON_ACK_TS:
-                    verifyExpectedValue(expectedAckTimestamp, logReplicationEntry.getMetadata().timestamp);
-                    if (expectedAckMsgType == logReplicationEntry.getMetadata().getMessageMetadataType()) {
+                    verifyExpectedValue(expectedAckTimestamp, logReplicationEntry.getMetadata().getTimestamp());
+                    if (expectedAckMsgType == logReplicationEntry.getMetadata().getEntryType()) {
                         blockUntilExpectedAckType.release();
                     }
 
-                    log.debug("expectedAckTs={}, logEntryTs={}", expectedAckTimestamp, logReplicationEntry.getMetadata().timestamp);
+                    log.debug("expectedAckTs={}, logEntryTs={}", expectedAckTimestamp, logReplicationEntry.getMetadata().getTimestamp());
 
-                    if (expectedAckTimestamp == logReplicationEntry.getMetadata().timestamp) {
+                    if (expectedAckTimestamp == logReplicationEntry.getMetadata().getTimestamp()) {
                         blockUntilExpectedAckTs.release();
                     }
                     break;

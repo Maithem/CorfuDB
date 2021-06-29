@@ -59,6 +59,9 @@ public abstract class AbstractQueuedStreamView extends
     @Getter
     private final ReadOptions readOptions;
 
+    @Getter
+    private final StreamOptions streamOptions;
+
     /** Create a new queued stream view.
      *
      * @param streamId  The ID of the stream
@@ -72,6 +75,7 @@ public abstract class AbstractQueuedStreamView extends
                 .clientCacheable(streamOptions.isCacheEntries())
                 .ignoreTrim(streamOptions.isIgnoreTrimmed())
                 .build();
+        this.streamOptions = streamOptions;
     }
 
     /** Add the given address to the resolved queue of the
@@ -194,14 +198,12 @@ public abstract class AbstractQueuedStreamView extends
             for (int retry = 0; retry < runtime.getParameters().getWriteRetry(); retry++) {
                 // Next, we call the acquisitionCallback, if present, informing
                 // the client of the token that we acquired.
-                if (acquisitionCallback != null) {
-                    if (!acquisitionCallback.apply(tokenResponse)) {
-                        // The client did not like our token, so we end here.
-                        // We'll leave the hole to be filled by the client or
-                        // someone else.
-                        log.warn("Acquisition rejected token={}", tokenResponse);
-                        return Address.NON_ADDRESS;
-                    }
+                if (acquisitionCallback != null && !acquisitionCallback.apply(tokenResponse)) {
+                    // The client did not like our token, so we end here.
+                    // We'll leave the hole to be filled by the client or
+                    // someone else.
+                    log.warn("Acquisition rejected token={}", tokenResponse);
+                    return Address.NON_ADDRESS;
                 }
 
                 // Now, we do the actual write. We could get an overwrite
@@ -216,11 +218,9 @@ public abstract class AbstractQueuedStreamView extends
                     log.warn("Overwrite occurred at {}", tokenResponse);
                     // We got overwritten, so we call the deacquisition callback
                     // to inform the client we didn't get the address.
-                    if (deacquisitionCallback != null) {
-                        if (!deacquisitionCallback.apply(tokenResponse)) {
-                            log.debug("Deacquisition requested abort");
-                            return Address.NON_ADDRESS;
-                        }
+                    if (deacquisitionCallback != null && !deacquisitionCallback.apply(tokenResponse)) {
+                        log.debug("Deacquisition requested abort");
+                        return Address.NON_ADDRESS;
                     }
                     // Request a new token, informing the sequencer we were
                     // overwritten.
@@ -310,8 +310,7 @@ public abstract class AbstractQueuedStreamView extends
      * list off there.
      * */
     @Override
-    protected List<ILogData> getNextEntries(QueuedStreamContext context, long maxGlobal,
-                                            Function<ILogData, Boolean> contextCheckFn) {
+    protected List<ILogData> getNextEntries(QueuedStreamContext context, long maxGlobal) {
         NavigableSet<Long> readSet = new TreeSet<>();
 
         // Scan backward in the stream to find interesting
@@ -335,10 +334,10 @@ public abstract class AbstractQueuedStreamView extends
         // we should pay attention to, then start with them.
         readSet.addAll(context.readCpQueue);
 
-        if (!context.readQueue.isEmpty() && context.readQueue.first() > maxGlobal) {
-            // If the lowest element is greater than maxGlobal, there's nothing
-            // more to return: readSet is ok as-is.
-        } else {
+        // If the lowest element is greater than maxGlobal, there's nothing
+        // more to return: readSet is ok as-is.
+        // Otherwise,
+        if (context.readQueue.isEmpty() || context.readQueue.first() <= maxGlobal){
             // Select everything in the read queue between
             // the start and maxGlobal
             readSet.addAll(context.readQueue.headSet(maxGlobal, true));
@@ -362,24 +361,10 @@ public abstract class AbstractQueuedStreamView extends
                 // Case of Checkpoint will never load these addresses, cause this is another stream
                 .filter(x -> x.containsStream(context.id))
                 .collect(Collectors.toList());
-
-        // If any entries change the context,
-        // don't return anything greater than
-        // that entry
-        Optional<ILogData> contextEntry = readFrom.stream()
-                .filter(contextCheckFn::apply).findFirst();
-        if (contextEntry.isPresent()) {
-            log.trace("getNextEntries[{}] context switch @ {}", this,
-                    contextEntry.get().getGlobalAddress());
-            int idx = readFrom.indexOf(contextEntry.get());
-            readFrom = readFrom.subList(0, idx + 1);
-            // NOTE: readSet's clear() changed underlying context.readQueue
-            readSet.headSet(contextEntry.get().getGlobalAddress(), true).clear();
-        } else {
-            // Clear the entries which were read
-            context.readQueue.headSet(maxGlobal, true).clear();
-            context.readCpQueue.headSet(maxGlobal, true).clear();
-        }
+        
+        // Clear the entries which were read
+        context.readQueue.headSet(maxGlobal, true).clear();
+        context.readCpQueue.headSet(maxGlobal, true).clear();
 
         // Transfer the addresses of the read entries to the resolved queue
         readFrom.forEach(entry -> addToResolvedQueue(context, entry.getGlobalAddress()));
@@ -396,6 +381,34 @@ public abstract class AbstractQueuedStreamView extends
                 .filter(entry -> !entry.isHole())
                 .collect(Collectors.toList());
     }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public List<ILogData> remainingAtMost(int maxEntries) {
+        // TODO: instrument remainingUpTo directly to limit the number of
+        // of entries returned instead of calling it.
+        if (maxEntries < 1) {
+            throw new IllegalArgumentException(
+                    "remainingAtMost(): maxEntries cannot be less than 1.");
+        }
+
+        long maxGlobal = getMaxGlobalFromMaxEntries(maxEntries);
+        if (Address.nonAddress(maxGlobal)) {
+            return Collections.emptyList();
+        }
+
+        return remainingUpTo(maxGlobal);
+    }
+
+    /**
+     * Get the largest address to read from the the current global pointer
+     * and the maximum number of entries to read.
+     *
+     * @return largest address to read
+     */
+    protected abstract long getMaxGlobalFromMaxEntries(int maxEntries);
 
     /**
      * Fill the read queue for the current context. This method is called
@@ -509,13 +522,11 @@ public abstract class AbstractQueuedStreamView extends
         // We check if we can fill partially from the resolved queue
         // This is a requirement for the getStreamAddressMaps as it considers the content of the resolved queue
         // to decide if needs to fetch the address maps or not.
-        if (context.globalPointer < context.maxResolution) {
-            if (fillFromResolved(context.maxResolution, context)) {
-                stopAddress = context.maxResolution;
-                log.trace("fillReadQueue[{}]: current pointer: {}, resolved up to: {}, readQueue: {}, " +
-                                "new stop address: {}", this, context.globalPointer,
-                        context.maxResolution, context.readQueue, stopAddress);
-            }
+        if (context.globalPointer < context.maxResolution && fillFromResolved(context.maxResolution, context)) {
+            stopAddress = context.maxResolution;
+            log.trace("fillReadQueue[{}]: current pointer: {}, resolved up to: {}, readQueue: {}, " +
+                            "new stop address: {}", this, context.globalPointer,
+                    context.maxResolution, context.readQueue, stopAddress);
         }
 
         // Now we fetch the address map for this stream from the sequencer in a single call, i.e.,

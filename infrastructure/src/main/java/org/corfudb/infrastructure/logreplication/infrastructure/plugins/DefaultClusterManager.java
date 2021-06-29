@@ -4,13 +4,13 @@ import lombok.Getter;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.logreplication.infrastructure.ClusterDescriptor;
+import org.corfudb.infrastructure.logreplication.infrastructure.LogReplicationDiscoveryServiceException;
 import org.corfudb.infrastructure.logreplication.infrastructure.NodeDescriptor;
 import org.corfudb.infrastructure.logreplication.infrastructure.TopologyDescriptor;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.ClusterRole;
 import org.corfudb.infrastructure.logreplication.proto.LogReplicationClusterInfo.TopologyConfigurationMsg;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuStoreMetadata;
-import org.corfudb.runtime.Messages;
 import org.corfudb.runtime.collections.CorfuStore;
 import org.corfudb.runtime.collections.CorfuStreamEntries;
 import org.corfudb.runtime.collections.CorfuStreamEntry;
@@ -19,7 +19,7 @@ import org.corfudb.runtime.collections.Table;
 import org.corfudb.runtime.collections.TableOptions;
 import org.corfudb.runtime.collections.TableSchema;
 import org.corfudb.runtime.exceptions.unrecoverable.UnrecoverableCorfuInterruptedError;
-import org.corfudb.utils.CommonTypes;
+import org.corfudb.runtime.proto.RpcCommon.UuidMsg;
 
 import java.io.File;
 import java.io.FileReader;
@@ -61,11 +61,12 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
 
     public static final String CONFIG_NAMESPACE = "ns_lr_config_it";
     public static final String CONFIG_TABLE_NAME = "lr_config_it";
-    public static final CommonTypes.Uuid OP_RESUME = CommonTypes.Uuid.newBuilder().setLsb(0L).setMsb(0L).build();
-    public static final CommonTypes.Uuid OP_SWITCH = CommonTypes.Uuid.newBuilder().setLsb(1L).setMsb(1L).build();
-    public static final CommonTypes.Uuid OP_TWO_ACTIVE = CommonTypes.Uuid.newBuilder().setLsb(2L).setMsb(2L).build();
-    public static final CommonTypes.Uuid OP_ALL_STANDBY = CommonTypes.Uuid.newBuilder().setLsb(3L).setMsb(3L).build();
-    public static final CommonTypes.Uuid OP_INVALID = CommonTypes.Uuid.newBuilder().setLsb(4L).setMsb(4L).build();
+    public static final UuidMsg OP_RESUME = UuidMsg.newBuilder().setLsb(0L).setMsb(0L).build();
+    public static final UuidMsg OP_SWITCH = UuidMsg.newBuilder().setLsb(1L).setMsb(1L).build();
+    public static final UuidMsg OP_TWO_ACTIVE = UuidMsg.newBuilder().setLsb(2L).setMsb(2L).build();
+    public static final UuidMsg OP_ALL_STANDBY = UuidMsg.newBuilder().setLsb(3L).setMsb(3L).build();
+    public static final UuidMsg OP_INVALID = UuidMsg.newBuilder().setLsb(4L).setMsb(4L).build();
+    public static final UuidMsg OP_ENFORCE_SNAPSHOT_FULL_SYNC = UuidMsg.newBuilder().setLsb(5L).setMsb(5L).build();
 
     @Getter
     private long configId;
@@ -91,23 +92,25 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
         clusterManagerCallback = new ClusterManagerCallback(this);
         corfuRuntime = CorfuRuntime.fromParameters(CorfuRuntime.CorfuRuntimeParameters.builder().build())
                 .parseConfigurationString("localhost:9000")
-                .setTransactionLogging(true)
                 .connect();
         corfuStore = new CorfuStore(corfuRuntime);
         CorfuStoreMetadata.Timestamp ts = corfuStore.getTimestamp();
         try {
-            Table<Messages.Uuid, Messages.Uuid, Messages.Uuid> table = corfuStore.openTable(
+            Table<UuidMsg, UuidMsg, UuidMsg> table = corfuStore.openTable(
                     CONFIG_NAMESPACE, CONFIG_TABLE_NAME,
-                    Messages.Uuid.class, Messages.Uuid.class, Messages.Uuid.class,
+                    UuidMsg.class, UuidMsg.class, UuidMsg.class,
                     TableOptions.builder().build()
             );
             table.clear();
+
+
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
         configStreamListener = new ConfigStreamListener(this);
         corfuStore.subscribe(configStreamListener, CONFIG_NAMESPACE,
-                Collections.singletonList(new TableSchema(CONFIG_TABLE_NAME, CommonTypes.Uuid.class, CommonTypes.Uuid.class, CommonTypes.Uuid.class)), ts);
+                Collections.singletonList(new TableSchema(CONFIG_TABLE_NAME,
+                        UuidMsg.class, UuidMsg.class, UuidMsg.class)), ts);
         thread = new Thread(clusterManagerCallback);
         thread.start();
     }
@@ -197,7 +200,7 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
         for (int i = 0; i < activeNodeNames.size(); i++) {
             log.info("Active Cluster Name {}, IpAddress {}", activeNodeNames.get(i), activeNodeHosts.get(i));
             NodeDescriptor nodeInfo = new NodeDescriptor(activeNodeHosts.get(i),
-                    activeLogReplicationPort, ACTIVE_CLUSTER_NAME, UUID.fromString(activeNodeIds.get(i)));
+                    activeLogReplicationPort, ACTIVE_CLUSTER_NAME, activeNodeIds.get(i), activeNodeIds.get(i));
             activeCluster.getNodesDescriptors().add(nodeInfo);
         }
 
@@ -208,7 +211,7 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
         for (int i = 0; i < standbyNodeNames.size(); i++) {
             log.info("Standby Cluster Name {}, IpAddress {}", standbyNodeNames.get(i), standbyNodeHosts.get(i));
             NodeDescriptor nodeInfo = new NodeDescriptor(standbyNodeHosts.get(i),
-                    standbyLogReplicationPort, STANDBY_CLUSTER_NAME, UUID.fromString(standbyNodeIds.get(i)));
+                    standbyLogReplicationPort, STANDBY_CLUSTER_NAME, standbyNodeIds.get(i), standbyNodeIds.get(i));
             standbySites.get(STANDBY_CLUSTER_NAME).getNodesDescriptors().add(nodeInfo);
         }
 
@@ -357,14 +360,14 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
 
         @Override
         public void onNext(CorfuStreamEntries results) {
-            log.info("ConfigStreamListener onNext {} with entry size {}", results, results.getEntries().size());
+            log.info("onNext :: entry size={}", results.getEntries().size());
             CorfuStreamEntry entry = results.getEntries().values()
                     .stream()
                     .findFirst()
                     .map(corfuStreamEntries -> corfuStreamEntries.get(0))
                     .orElse(null);
             if (entry != null && entry.getOperation().equals(CorfuStreamEntry.OperationType.UPDATE)) {
-                log.info("onNext entry is {}, key{}, p{}, m{}, op{}", entry, entry.getKey(), entry.getPayload(), entry.getMetadata(), entry.getOperation());
+                log.info("onNext :: key={}, payload={}, metadata={}", entry.getKey(), entry.getPayload(), entry.getMetadata());
                 if (entry.getKey().equals(OP_SWITCH)) {
                     clusterManager.getClusterManagerCallback()
                             .applyNewTopologyConfig(clusterManager.generateConfigWithRoleSwitch());
@@ -380,7 +383,21 @@ public class DefaultClusterManager extends CorfuReplicationClusterManagerBaseAda
                 } else if (entry.getKey().equals(OP_RESUME)) {
                     clusterManager.getClusterManagerCallback()
                             .applyNewTopologyConfig(clusterManager.generateDefaultValidConfig());
+                } else if(entry.getKey().equals(OP_ENFORCE_SNAPSHOT_FULL_SYNC)) {
+                    try {
+                        clusterManager.forceSnapshotSync(clusterManager.queryTopologyConfig(true).getClustersList().get(1).getId());
+                    } catch (LogReplicationDiscoveryServiceException e) {
+                        log.warn("Caught a RuntimeException ", e);
+                        ClusterRole role = clusterManager.getCorfuReplicationDiscoveryService().getLocalClusterRoleType();
+                        if (role != ClusterRole.STANDBY) {
+                            log.error("The current cluster role is {} and should not throw a RuntimeException for forceSnapshotSync call.", role);
+                            Thread.interrupted();
+                        }
+                    }
                 }
+            } else {
+                log.info("onNext :: operation={}, key={}, payload={}, metadata={}", entry.getOperation().name(),
+                        entry.getKey(), entry.getPayload(), entry.getMetadata());
             }
         }
 

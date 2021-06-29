@@ -1,12 +1,16 @@
 package org.corfudb.runtime.clients;
 
+import java.util.concurrent.CompletableFuture;
+import java.util.UUID;
 import lombok.Getter;
 import lombok.Setter;
-import org.corfudb.protocols.wireprotocol.CorfuMsg;
-import org.corfudb.protocols.wireprotocol.PriorityLevel;
 
-import java.util.UUID;
-import java.util.concurrent.CompletableFuture;
+import org.corfudb.protocols.service.CorfuProtocolMessage.ClusterIdCheck;
+import org.corfudb.runtime.proto.service.CorfuMessage.PriorityLevel;
+import org.corfudb.protocols.service.CorfuProtocolMessage.EpochCheck;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+
+import static org.corfudb.protocols.CorfuProtocolCommon.getUuidMsg;
 
 /**
  * Abstract clients stamped with an epoch to send messages stamped with the required epoch.
@@ -34,8 +38,9 @@ public abstract class AbstractClient implements IClient {
         this.clusterID = clusterID;
     }
 
-    <T> CompletableFuture<T> sendMessageWithFuture(CorfuMsg msg) {
-        return router.sendMessageAndGetCompletable(
-                msg.setEpoch(epoch).setClusterID(clusterID).setPriorityLevel(priorityLevel));
+    <T> CompletableFuture<T> sendRequestWithFuture(RequestPayloadMsg payload,
+                                                   ClusterIdCheck ignoreClusterId, EpochCheck ignoreEpoch) {
+        return router.sendRequestAndGetCompletable(payload, epoch,
+                getUuidMsg(clusterID), priorityLevel, ignoreClusterId, ignoreEpoch);
     }
 }

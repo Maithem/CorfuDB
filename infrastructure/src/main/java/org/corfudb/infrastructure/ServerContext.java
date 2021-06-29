@@ -1,32 +1,11 @@
 package org.corfudb.infrastructure;
 
-import com.codahale.metrics.MetricRegistry;
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_NUM_MSG_PER_BATCH;
+import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_DATA_MSG_SIZE_SUPPORTED;
+
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 import io.netty.channel.EventLoopGroup;
-import lombok.AccessLevel;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import org.corfudb.comm.ChannelImplementation;
-import org.corfudb.infrastructure.datastore.DataStore;
-import org.corfudb.infrastructure.datastore.KvDataStore.KvRecord;
-import org.corfudb.infrastructure.paxos.PaxosDataStore;
-import org.corfudb.protocols.wireprotocol.PriorityLevel;
-import org.corfudb.protocols.wireprotocol.failuredetector.FailureDetectorMetrics;
-import org.corfudb.runtime.CorfuRuntime;
-import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
-import org.corfudb.runtime.exceptions.WrongEpochException;
-import org.corfudb.runtime.view.ConservativeFailureHandlerPolicy;
-import org.corfudb.runtime.view.IReconfigurationHandlerPolicy;
-import org.corfudb.runtime.view.Layout;
-import org.corfudb.runtime.view.Layout.LayoutSegment;
-import org.corfudb.util.MetricsUtils;
-import org.corfudb.util.NodeLocator;
-import org.corfudb.util.UuidUtils;
-import org.corfudb.utils.lock.Lock;
-
-import javax.annotation.Nonnull;
 import java.io.File;
 import java.nio.file.Files;
 import java.time.Duration;
@@ -42,10 +21,31 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import javax.annotation.Nonnull;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import org.corfudb.comm.ChannelImplementation;
+import org.corfudb.infrastructure.datastore.DataStore;
+import org.corfudb.infrastructure.datastore.KvDataStore.KvRecord;
+import org.corfudb.infrastructure.paxos.PaxosDataStore;
+import org.corfudb.protocols.wireprotocol.failuredetector.FailureDetectorMetrics;
+import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
+import org.corfudb.runtime.exceptions.WrongEpochException;
+import org.corfudb.runtime.proto.service.CorfuMessage.PriorityLevel;
+import org.corfudb.runtime.view.ConservativeFailureHandlerPolicy;
+import org.corfudb.runtime.view.IReconfigurationHandlerPolicy;
+import org.corfudb.runtime.view.Layout;
+import org.corfudb.runtime.view.Layout.LayoutSegment;
+import org.corfudb.util.NodeLocator;
+import org.corfudb.util.UuidUtils;
+import org.corfudb.utils.lock.Lock;
 
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.MAX_DATA_MSG_SIZE_SUPPORTED;
-import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_NUM_MSG_PER_BATCH;
-import static org.corfudb.util.MetricsUtils.isMetricsReportingSetUp;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
 
 /**
  * Server Context:
@@ -140,9 +140,6 @@ public class ServerContext implements AutoCloseable {
     private final EventLoopGroup clientGroup;
 
     @Getter
-    private final EventLoopGroup bossGroup;
-
-    @Getter
     private final EventLoopGroup workerGroup;
 
     @Getter (AccessLevel.PACKAGE)
@@ -150,9 +147,6 @@ public class ServerContext implements AutoCloseable {
 
     @Getter
     private final String localEndpoint;
-
-    @Getter
-    private static final MetricRegistry metrics = new MetricRegistry();
 
     @Getter
     private final Set<String> dsFilePrefixesForCleanup =
@@ -177,46 +171,58 @@ public class ServerContext implements AutoCloseable {
         if (providedEventLoops) {
             clientGroup = getServerConfig(EventLoopGroup.class, "client");
             workerGroup = getServerConfig(EventLoopGroup.class, "worker");
-            bossGroup = getServerConfig(EventLoopGroup.class, "boss");
         } else {
             clientGroup = getNewClientGroup();
             workerGroup = getNewWorkerGroup();
-            bossGroup = getNewBossGroup();
         }
 
         nodeLocator = NodeLocator
                 .parseString(serverConfig.get("--address") + ":" + serverConfig.get("<port>"));
         localEndpoint = nodeLocator.toEndpointUrl();
-
-        // Metrics setup & reporting configuration
-        if (!isMetricsReportingSetUp(metrics)) {
-            MetricsUtils.metricsReportingSetup(metrics);
-        }
     }
 
     int getBaseServerThreadCount() {
-        Integer threadCount = getServerConfig(Integer.class, "--base-server-threads");
-        return threadCount == null ? 1 : threadCount;
+        Optional<String> threadCount = getServerConfig("--base-server-threads");
+        return threadCount.map(Integer::parseInt).orElse(1);
     }
 
-    int getLayoutServerThreadCount() {
-        Integer threadCount = getServerConfig(Integer.class, "--layout-server-threads");
-        return threadCount == null ? 1 : threadCount;
-    }
-
-    public int getLogunitThreadCount() {
-        Integer threadCount = getServerConfig(Integer.class, "--logunit-threads");
-        return threadCount == null ? Runtime.getRuntime().availableProcessors() * 2 : threadCount;
+    public int getLogUnitThreadCount() {
+        Optional<String> threadCount = getServerConfig("--logunit-threads");
+        return threadCount.map(Integer::parseInt).orElse(Runtime.getRuntime().availableProcessors() * 2);
     }
 
     public int getManagementServerThreadCount() {
-        Integer threadCount = getServerConfig(Integer.class, "--management-server-threads");
-        return threadCount == null ? 4 : threadCount;
+        Optional<String> threadCount = getServerConfig("--management-server-threads");
+        return threadCount.map(Integer::parseInt).orElse(4);
     }
 
     public String getPluginConfigFilePath() {
         String pluginConfigFilePath = getServerConfig(String.class, "--plugin");
         return pluginConfigFilePath == null ? PLUGIN_CONFIG_FILE_PATH : pluginConfigFilePath;
+    }
+
+    /**
+     * Get an ExecutorService that can be used by the servers to
+     * process RPCs. Uses a ServerThreadFactory as the underlying
+     * thread factory.
+     * @param threadCount   The number of threads to use in the pool
+     * @param threadPrefix  The naming prefix
+     * @return The newly created ExecutorService
+     */
+    public ExecutorService getExecutorService(int threadCount, String threadPrefix) {
+        return getExecutorService(threadCount,
+                new ServerThreadFactory(threadPrefix, new ServerThreadFactory.ExceptionHandler()));
+    }
+
+    /**
+     * Get an ExecutorService that can be used by the servers to
+     * process RPCs.
+     * @param threadCount    The number of threads to use in the pool
+     * @param threadFactory  The underlying thread factory
+     * @return The newly created ExecutorService
+     */
+    public ExecutorService getExecutorService(int threadCount, @Nonnull ThreadFactory threadFactory) {
+        return Executors.newFixedThreadPool(threadCount, threadFactory);
     }
 
     /**
@@ -245,7 +251,7 @@ public class ServerContext implements AutoCloseable {
      * @return
      */
     public int getLogReplicationMaxDataMessageSize() {
-        String val = getServerConfig(String.class, "--max-data-message-size");
+        String val = getServerConfig(String.class, "--max-replication-data-message-size");
         return val == null ? MAX_DATA_MSG_SIZE_SUPPORTED : Integer.parseInt(val);
     }
 
@@ -369,6 +375,17 @@ public class ServerContext implements AutoCloseable {
         return (T) getServerConfig().get(optionName);
     }
 
+    /**
+     * Get a field from the server configuration map.
+     *
+     * @param optionName    The name of the option to retrieve.
+     * @param <T>           The type of the field to return.
+     * @return              The field with the give option name.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> Optional<T> getServerConfig(String optionName) {
+        return Optional.ofNullable((T) getServerConfig().get(optionName));
+    }
 
     /**
      * Install a single node layout if and only if no layout is currently installed.
@@ -481,12 +498,11 @@ public class ServerContext implements AutoCloseable {
             dataStore.put(SERVER_EPOCH_RECORD, serverEpoch);
             r.setServerEpoch(serverEpoch);
             getServers().forEach(s -> s.sealServerWithEpoch(serverEpoch));
-        } else if (serverEpoch == lastEpoch) {
-            // Setting to the same epoch, don't need to do anything.
-        } else {
+        } else if (lastEpoch > serverEpoch){
             // Regressing, throw an exception.
             throw new WrongEpochException(lastEpoch);
         }
+        // If both epochs are same then no need to do anything.
     }
 
     public void setLayoutInHistory(Layout layout) {
@@ -642,21 +658,6 @@ public class ServerContext implements AutoCloseable {
     }
 
     /**
-     * Get a new "boss" group, which services (accepts) incoming connections.
-     *
-     * @return A boss group.
-     */
-    private EventLoopGroup getNewBossGroup() {
-        final ThreadFactory threadFactory = new ThreadFactoryBuilder()
-                .setNameFormat(getThreadPrefix() + "accept-%d")
-                .build();
-        EventLoopGroup group = getChannelImplementation().getGenerator()
-                .generate(1, threadFactory);
-        log.info("getBossGroup: Type {}", group.getClass().getSimpleName());
-        return group;
-    }
-
-    /**
      * Get a new "worker" group, which services incoming requests.
      *
      * @return A worker group.
@@ -728,11 +729,6 @@ public class ServerContext implements AutoCloseable {
         // Shutdown the active event loops unless they were provided to us
         if (!getChannelImplementation().equals(ChannelImplementation.LOCAL)) {
             clientGroup.shutdownGracefully(
-                    params.getNettyShutdownQuitePeriod(),
-                    params.getNettyShutdownTimeout(),
-                    TimeUnit.MILLISECONDS
-            );
-            bossGroup.shutdownGracefully(
                     params.getNettyShutdownQuitePeriod(),
                     params.getNettyShutdownTimeout(),
                     TimeUnit.MILLISECONDS

@@ -1,43 +1,51 @@
 package org.corfudb.infrastructure.logreplication.replication.send;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.protobuf.TextFormat;
+import io.micrometer.core.instrument.Tag;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.common.util.ObservableValue;
 import org.corfudb.infrastructure.logreplication.DataSender;
-import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationFSM;
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent;
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent.LogReplicationEventType;
+import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationFSM;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.ReadProcessor;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.SnapshotReadMessage;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.SnapshotReader;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntryMetadata;
-import org.corfudb.protocols.wireprotocol.logreplication.MessageType;
 import org.corfudb.runtime.CorfuRuntime;
+import org.corfudb.runtime.LogReplication;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryType;
 import org.corfudb.runtime.exceptions.TrimmedException;
 import org.corfudb.runtime.view.Address;
 
 import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_MAX_NUM_MSG_PER_BATCH;
 import static org.corfudb.infrastructure.logreplication.LogReplicationConfig.DEFAULT_TIMEOUT_MS;
+import static org.corfudb.protocols.CorfuProtocolCommon.getUuidMsg;
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.getLrEntryAckMsg;
 
 /**
- *  This class is responsible of transmitting a consistent view of the data at a given timestamp,
- *  i.e, reading and sending a snapshot of the data for the requested streams.
- *
- *  It reads log entries from the data-store through the SnapshotReader, and hands it to the
- *  DataSender (the application specific callback for sending data to the remote cluster).
- *
- *  The SnapshotReader has a default implementation based on reads at the stream layer
- *  (no serialization/deserialization) required.
- *
- *  DataSender is implemented by the application, as communication channels between sites are out of the scope
- *  of CorfuDB.
+ * This class is responsible of transmitting a consistent view of the data at a given timestamp,
+ * i.e, reading and sending a snapshot of the data for the requested streams.
+ * <p>
+ * It reads log entries from the data-store through the SnapshotReader, and hands it to the
+ * DataSender (the application specific callback for sending data to the remote cluster).
+ * <p>
+ * The SnapshotReader has a default implementation based on reads at the stream layer
+ * (no serialization/deserialization) required.
+ * <p>
+ * DataSender is implemented by the application, as communication channels between sites are out of the scope
+ * of CorfuDB.
  */
 @Slf4j
 public class SnapshotSender {
@@ -61,6 +69,8 @@ public class SnapshotSender {
     // For testing purposes, used to count the number of messages sent in order to interrupt snapshot sync
     private ObservableValue observedCounter = new ObservableValue(0);
 
+    private final Optional<AtomicLong> messageCounter;
+
     private volatile boolean stopSnapshotSync = false;
 
     public SnapshotSender(CorfuRuntime runtime, SnapshotReader snapshotReader, DataSender dataSender,
@@ -70,9 +80,13 @@ public class SnapshotSender {
         this.fsm = fsm;
         this.maxNumSnapshotMsgPerBatch = snapshotSyncBatchSize <= 0 ? DEFAULT_MAX_NUM_MSG_PER_BATCH : snapshotSyncBatchSize;
         this.dataSenderBufferManager = new SnapshotSenderBufferManager(dataSender, fsm.getAckReader());
+        this.messageCounter = MeterRegistryProvider.getInstance().map(registry ->
+                registry.gauge("logreplication.messages",
+                        ImmutableList.of(Tag.of("replication.type", "snapshot")),
+                        new AtomicLong(0)));
     }
 
-    private CompletableFuture<LogReplicationEntry> snapshotSyncAck;
+    private CompletableFuture<LogReplicationEntryMsg> snapshotSyncAck;
 
     /**
      * Initiate Snapshot Sync, this entails reading and sending data for a given snapshot.
@@ -87,8 +101,8 @@ public class SnapshotSender {
         boolean completed = false;  // Flag indicating the snapshot sync is completed
         boolean cancel = false;     // Flag indicating snapshot sync needs to be canceled
         int messagesSent = 0;       // Limit the number of messages to maxNumSnapshotMsgPerBatch. The reason we need to limit
-                                    // is because by design several state machines can share the same thread pool,
-                                    // therefore, we need to hand the thread for other workers to execute.
+        // is because by design several state machines can share the same thread pool,
+        // therefore, we need to hand the thread for other workers to execute.
         SnapshotReadMessage snapshotReadMessage;
 
         // Skip if no data is present in the log
@@ -117,18 +131,20 @@ public class SnapshotSender {
                 }
 
                 messagesSent += processReads(snapshotReadMessage.getMessages(), snapshotSyncEventId, completed);
+                final long  messagesSentSnapshot = messagesSent;
+                messageCounter.ifPresent(counter -> counter.addAndGet(messagesSentSnapshot));
                 observedCounter.setValue(messagesSent);
             }
 
             if (completed) {
                 // Block until ACK from last sent message is received
                 try {
-                    LogReplicationEntry ack = snapshotSyncAck.get(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                    LogReplicationEntryMsg ack = snapshotSyncAck.get(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                     if (ack.getMetadata().getSnapshotTimestamp() == baseSnapshotTimestamp &&
-                            ack.getMetadata().getMessageMetadataType().equals(MessageType.SNAPSHOT_TRANSFER_COMPLETE)) {
+                            ack.getMetadata().getEntryType().equals(LogReplicationEntryType.SNAPSHOT_TRANSFER_COMPLETE)) {
                         // Snapshot Sync Transfer Completed
                         log.info("Snapshot sync transfer completed for {} on timestamp={}, ack={}", snapshotSyncEventId,
-                                baseSnapshotTimestamp, ack.getMetadata());
+                                baseSnapshotTimestamp, TextFormat.shortDebugString(ack.getMetadata()));
                         snapshotSyncTransferComplete(snapshotSyncEventId);
                     } else {
                         log.warn("Expected ack for {}, but received for a different snapshot {}", baseSnapshotTimestamp,
@@ -164,13 +180,15 @@ public class SnapshotSender {
                 snapshotSyncAck.get(DEFAULT_TIMEOUT_MS, TimeUnit.MILLISECONDS);
                 snapshotSyncTransferComplete(snapshotSyncEventId);
             } catch (Exception e) {
-                //todo: generate an event for discovery service
-                log.warn("While sending data, caught an exception. Will notify discovery service");
+                log.warn("Caught exception while sending data to standby.", e);
+                snapshotSyncCancel(snapshotSyncEventId, LogReplicationError.UNKNOWN);
             }
         }
     }
 
-    private int processReads(List<LogReplicationEntry> logReplicationEntries, UUID snapshotSyncEventId, boolean completed) {
+    private int processReads(List<LogReplicationEntryMsg> logReplicationEntries,
+                             UUID snapshotSyncEventId,
+                             boolean completed) {
         int numMessages = 0;
 
         // If we are starting a snapshot sync, send a start marker.
@@ -180,11 +198,19 @@ public class SnapshotSender {
             numMessages++;
         }
 
-        dataSenderBufferManager.sendWithBuffering(logReplicationEntries);
+
+        if (MeterRegistryProvider.getInstance().isPresent()) {
+            dataSenderBufferManager.sendWithBuffering(logReplicationEntries,
+                    "logreplication.sender.duration.seconds",
+                    Tag.of("replication.type", "snapshot"));
+        }
+        else {
+            dataSenderBufferManager.sendWithBuffering(logReplicationEntries);
+        }
 
         // If Snapshot is complete, add end marker
         if (completed) {
-            LogReplicationEntry endDataMessage = getSnapshotSyncEndMarker(snapshotSyncEventId);
+            LogReplicationEntryMsg endDataMessage = getSnapshotSyncEndMarker(snapshotSyncEventId);
             log.info("SnapshotSender sent out SNAPSHOT_END message {} ", endDataMessage.getMetadata());
             snapshotSyncAck = dataSenderBufferManager.sendWithBuffering(endDataMessage);
             numMessages++;
@@ -199,18 +225,30 @@ public class SnapshotSender {
      * @param snapshotSyncEventId snapshot sync event identifier
      * @return snapshot sync start marker as LogReplicationEntry
      */
-    private LogReplicationEntry getSnapshotSyncStartMarker(UUID snapshotSyncEventId) {
-        LogReplicationEntryMetadata metadata = new LogReplicationEntryMetadata(MessageType.SNAPSHOT_START, fsm.getTopologyConfigId(),
-                snapshotSyncEventId, Address.NON_ADDRESS, Address.NON_ADDRESS, baseSnapshotTimestamp, Address.NON_ADDRESS);
-        LogReplicationEntry emptyEntry = new LogReplicationEntry(metadata);
-        return emptyEntry;
+    private LogReplicationEntryMsg getSnapshotSyncStartMarker(UUID snapshotSyncEventId) {
+        LogReplication.LogReplicationEntryMetadataMsg metadata = LogReplication.LogReplicationEntryMetadataMsg.newBuilder()
+                .setEntryType(LogReplicationEntryType.SNAPSHOT_START)
+                .setTopologyConfigID(fsm.getTopologyConfigId())
+                .setSyncRequestId(getUuidMsg(snapshotSyncEventId))
+                .setTimestamp(Address.NON_ADDRESS)
+                .setPreviousTimestamp(Address.NON_ADDRESS)
+                .setSnapshotTimestamp(baseSnapshotTimestamp)
+                .setSnapshotSyncSeqNum(Address.NON_ADDRESS)
+                .build();
+        return getLrEntryAckMsg(metadata);
     }
 
-    private LogReplicationEntry getSnapshotSyncEndMarker(UUID snapshotSyncEventId) {
-        LogReplicationEntryMetadata metadata = new LogReplicationEntryMetadata(MessageType.SNAPSHOT_END, fsm.getTopologyConfigId(), snapshotSyncEventId,
-                Address.NON_ADDRESS, Address.NON_ADDRESS, baseSnapshotTimestamp, Address.NON_ADDRESS);
-        LogReplicationEntry emptyEntry = new LogReplicationEntry(metadata);
-        return emptyEntry;
+    private LogReplicationEntryMsg getSnapshotSyncEndMarker(UUID snapshotSyncEventId) {
+        LogReplication.LogReplicationEntryMetadataMsg metadata = LogReplication.LogReplicationEntryMetadataMsg.newBuilder()
+                .setEntryType(LogReplicationEntryType.SNAPSHOT_END)
+                .setTopologyConfigID(fsm.getTopologyConfigId())
+                .setSyncRequestId(getUuidMsg(snapshotSyncEventId))
+                .setTimestamp(Address.NON_ADDRESS)
+                .setPreviousTimestamp(Address.NON_ADDRESS)
+                .setSnapshotTimestamp(baseSnapshotTimestamp)
+                .setSnapshotSyncSeqNum(Address.NON_ADDRESS)
+                .build();
+        return getLrEntryAckMsg(metadata);
     }
 
     /**
@@ -229,7 +267,7 @@ public class SnapshotSender {
      * Cancel Snapshot Sync due to an error.
      *
      * @param snapshotSyncEventId unique identifier for the snapshot sync task
-     * @param error specific error cause
+     * @param error               specific error cause
      */
     private void snapshotSyncCancel(UUID snapshotSyncEventId, LogReplicationError error) {
         // Report error to the application through the dataSender
@@ -237,8 +275,7 @@ public class SnapshotSender {
 
         log.error("SNAPSHOT SYNC is being CANCELED, due to {}", error.getDescription());
 
-        // Enqueue cancel event, this will cause a transition to the require snapshot sync request, which
-        // will notify application through the data control about this request.
+        // Enqueue cancel event, this will cause re-entrance to snapshot sync to start a new cycle
         fsm.input(new LogReplicationEvent(LogReplicationEventType.SYNC_CANCEL,
                 new LogReplicationEventMetadata(snapshotSyncEventId)));
     }

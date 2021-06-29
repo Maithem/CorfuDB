@@ -7,18 +7,18 @@ import lombok.extern.slf4j.Slf4j;
 import org.corfudb.infrastructure.LogReplicationRuntimeParameters;
 import org.corfudb.infrastructure.logreplication.DataSender;
 import org.corfudb.infrastructure.logreplication.LogReplicationConfig;
-import org.corfudb.infrastructure.logreplication.replication.fsm.ObservableAckMsg;
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent;
+import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent.LogReplicationEventType;
 import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationFSM;
+import org.corfudb.infrastructure.logreplication.replication.fsm.ObservableAckMsg;
 import org.corfudb.infrastructure.logreplication.replication.receive.LogReplicationMetadataManager;
-import org.corfudb.infrastructure.logreplication.runtime.LogReplicationClient;
 import org.corfudb.infrastructure.logreplication.replication.send.CorfuDataSender;
-import org.corfudb.infrastructure.logreplication.replication.send.logreader.DefaultReadProcessor;
 import org.corfudb.infrastructure.logreplication.replication.send.LogReplicationEventMetadata;
+import org.corfudb.infrastructure.logreplication.replication.send.logreader.DefaultReadProcessor;
 import org.corfudb.infrastructure.logreplication.replication.send.logreader.ReadProcessor;
+import org.corfudb.infrastructure.logreplication.runtime.LogReplicationClient;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.CorfuRuntime.CorfuRuntimeParameters;
-import org.corfudb.infrastructure.logreplication.replication.fsm.LogReplicationEvent.LogReplicationEventType;
 
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
@@ -113,13 +113,14 @@ public class LogReplicationSourceManager {
         ReadProcessor readProcessor = new DefaultReadProcessor(runtime);
         this.metadataManager = metadataManager;
         // Ack Reader for Snapshot and LogEntry Sync
-        ackReader = new LogReplicationAckReader(this.metadataManager, config, runtime,
+        this.ackReader = new LogReplicationAckReader(this.metadataManager, config, runtime,
                 params.getRemoteClusterDescriptor().getClusterId());
 
         this.logReplicationFSM = new LogReplicationFSM(this.runtime, config, params.getRemoteClusterDescriptor(),
                 dataSender, readProcessor, logReplicationFSMWorkers, ackReader);
 
         this.logReplicationFSM.setTopologyConfigId(params.getTopologyConfigId());
+        this.ackReader.startAckReader(this.logReplicationFSM.getLogEntryReader());
     }
 
     /**
@@ -130,11 +131,23 @@ public class LogReplicationSourceManager {
      * @return unique identifier for this snapshot sync request.
      */
     public UUID startSnapshotSync() {
+        return startSnapshotSync(new LogReplicationEvent(LogReplicationEventType.SNAPSHOT_SYNC_REQUEST), false);
+    }
+
+    /**
+     * Signal start of a forced snapshot sync
+     *
+     * @param snapshotSyncRequestId unique identifier of the forced snapshot sync (already provided to the caller)
+     */
+    public void startForcedSnapshotSync(UUID snapshotSyncRequestId) {
+        startSnapshotSync(new LogReplicationEvent(LogReplicationEventType.SNAPSHOT_SYNC_REQUEST, snapshotSyncRequestId), true);
+    }
+
+    private UUID startSnapshotSync(LogReplicationEvent snapshotSyncRequest, boolean forced) {
+        log.info("Start Snapshot Sync, requestId={}, forced={}", snapshotSyncRequest.getEventId(), forced);
         // Enqueue snapshot sync request into Log Replication FSM
-        LogReplicationEvent snapshotSyncRequest = new LogReplicationEvent(LogReplicationEventType.SNAPSHOT_SYNC_REQUEST);
-        log.info("Start Snapshot Sync, requestId={}", snapshotSyncRequest.getEventID());
         logReplicationFSM.input(snapshotSyncRequest);
-        return snapshotSyncRequest.getEventID();
+        return snapshotSyncRequest.getEventId();
     }
 
     /**

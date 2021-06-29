@@ -14,7 +14,6 @@ import org.corfudb.infrastructure.TestLayoutBuilder;
 import org.corfudb.infrastructure.TestServerRouter;
 import org.corfudb.infrastructure.orchestrator.actions.RestoreRedundancyMergeSegments;
 import org.corfudb.infrastructure.redundancy.RedundancyCalculator;
-import org.corfudb.protocols.wireprotocol.CorfuMsgType;
 import org.corfudb.protocols.wireprotocol.DataType;
 import org.corfudb.protocols.wireprotocol.LogData;
 import org.corfudb.protocols.wireprotocol.ReadResponse;
@@ -23,6 +22,9 @@ import org.corfudb.protocols.wireprotocol.TokenResponse;
 import org.corfudb.runtime.CorfuRuntime;
 import org.corfudb.runtime.clients.TestRule;
 import org.corfudb.runtime.exceptions.RetryExhaustedException;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg.PayloadCase;
+import org.corfudb.runtime.proto.service.CorfuMessage.RequestPayloadMsg;
+import org.corfudb.runtime.proto.service.CorfuMessage.ResponsePayloadMsg;
 import org.corfudb.runtime.view.ClusterStatusReport.ClusterStatus;
 import org.corfudb.runtime.view.ClusterStatusReport.ClusterStatusReliability;
 import org.corfudb.runtime.view.ClusterStatusReport.ConnectivityStatus;
@@ -409,10 +411,10 @@ public class StateTransferTest extends AbstractViewTest {
         addServer(SERVERS.PORT_1);
         addServer(SERVERS.PORT_2);
 
-        addServerRule(SERVERS.PORT_2, new TestRule().matches(
-                msg -> !msg.getMsgType().equals(CorfuMsgType.LAYOUT_BOOTSTRAP)
-                        && !msg.getMsgType().equals(CorfuMsgType.MANAGEMENT_BOOTSTRAP_REQUEST))
-                .drop());
+        addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
+                msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_LAYOUT_REQUEST)).drop());
+        addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
+                msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_MANAGEMENT_REQUEST)).drop());
 
         final long writtenAddressesBatch1 = 3L;
         final long writtenAddressesBatch2 = 6L;
@@ -570,8 +572,8 @@ public class StateTransferTest extends AbstractViewTest {
                 .build();
 
         // Drop read responses to make sure state transfer will fail if it happens
-        addServerRule(SERVERS.PORT_1, new TestRule().matches(m ->
-                m.getMsgType().equals(CorfuMsgType.READ_RESPONSE)).drop());
+        addServerRule(SERVERS.PORT_1, new TestRule().responseMatches(m ->
+                m.getPayload().getPayloadCase().equals(ResponsePayloadMsg.PayloadCase.READ_LOG_RESPONSE)).drop());
 
         bootstrapAllServers(layout);
 
@@ -657,8 +659,8 @@ public class StateTransferTest extends AbstractViewTest {
         AtomicLong allowedWrites = new AtomicLong(rangeWriteAllowedCount);
 
         // Allow only addresses 0 - 49 to be written.
-        addClientRule(rt, SERVERS.ENDPOINT_1, new TestRule().matches(
-                msg -> msg.getMsgType().equals(CorfuMsgType.RANGE_WRITE) &&
+        addClientRule(rt, SERVERS.ENDPOINT_1, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(RequestPayloadMsg.PayloadCase.RANGE_WRITE_LOG_REQUEST) &&
                         allowedWrites.decrementAndGet() < 0).drop());
 
         final RestoreRedundancyMergeSegments action1 = RestoreRedundancyMergeSegments
@@ -695,8 +697,8 @@ public class StateTransferTest extends AbstractViewTest {
         AtomicLong deltaBatches = new AtomicLong(0L);
 
         // Now count how many batches are transferred.
-        addClientRule(rt, SERVERS.ENDPOINT_1, new TestRule().matches(
-                msg -> msg.getMsgType().equals(CorfuMsgType.RANGE_WRITE) &&
+        addClientRule(rt, SERVERS.ENDPOINT_1, new TestRule().requestMatches(msg ->
+                msg.getPayload().getPayloadCase().equals(RequestPayloadMsg.PayloadCase.RANGE_WRITE_LOG_REQUEST) &&
                         deltaBatches.incrementAndGet() > 0));
 
         action1.impl(rt);
@@ -996,14 +998,16 @@ public class StateTransferTest extends AbstractViewTest {
                        Set<Long> noWriteHoles, Set<Long> partialWriteHoles) throws Exception {
         for (long i = 0; i < numIter; i++) {
             TokenResponse token = runtime.getSequencerView().next();
-            if (noWriteHoles.contains(i)) {
-                // Write nothing to create a hole on all log units.
-            } else if (partialWriteHoles.contains(i)) {
-                // Write to head log unit to create a partial write hole.
-                runtime.getLayoutView().getRuntimeLayout().getLogUnitClient(SERVERS.ENDPOINT_0)
-                        .write(getLogData(token, "partial write".getBytes())).get();
-            } else {
-                runtime.getAddressSpaceView().write(token, "Test Payload".getBytes());
+            // If noWriteHoles contains i, no need to write anything so that a hole is created on all log units.
+            // Otherwise,
+            if (!noWriteHoles.contains(i)) {
+                if (partialWriteHoles.contains(i)) {
+                    // Write to head log unit to create a partial write hole.
+                    runtime.getLayoutView().getRuntimeLayout().getLogUnitClient(SERVERS.ENDPOINT_0)
+                            .write(getLogData(token, "partial write".getBytes())).get();
+                } else {
+                    runtime.getAddressSpaceView().write(token, "Test Payload".getBytes());
+                }
             }
         }
     }
@@ -1272,10 +1276,10 @@ public class StateTransferTest extends AbstractViewTest {
             addServer(SERVERS.PORT_2, sc2);
 
             // Add rule to drop all msgs except for service discovery ones
-            addServerRule(SERVERS.PORT_2, new TestRule().matches(
-                    msg -> !msg.getMsgType().equals(CorfuMsgType.LAYOUT_BOOTSTRAP)
-                            && !msg.getMsgType().equals(CorfuMsgType.MANAGEMENT_BOOTSTRAP_REQUEST))
-                    .drop());
+            addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
+                    msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_LAYOUT_REQUEST)).drop());
+            addServerRule(SERVERS.PORT_2, new TestRule().requestMatches(
+                    msg -> !msg.getPayload().getPayloadCase().equals(PayloadCase.BOOTSTRAP_MANAGEMENT_REQUEST)).drop());
 
             final long writtenAddressesBatch1 = 1500L;
             final long writtenAddressesBatch2 = 3000L;
@@ -1451,11 +1455,11 @@ public class StateTransferTest extends AbstractViewTest {
             Token trimMark2 = Token.of(l1.getEpoch(), 150);
 
             rt.getLayoutView().getRuntimeLayout().getLogUnitClient(SERVERS.ENDPOINT_0)
-                    .prefixTrim(trimMark0);
+                    .prefixTrim(trimMark0).join();
             rt.getLayoutView().getRuntimeLayout().getLogUnitClient(SERVERS.ENDPOINT_1)
-                    .prefixTrim(trimMark1);
+                    .prefixTrim(trimMark1).join();
             rt.getLayoutView().getRuntimeLayout().getLogUnitClient(SERVERS.ENDPOINT_2)
-                    .prefixTrim(trimMark2);
+                    .prefixTrim(trimMark2).join();
 
             autoCommitService.runAutoCommit();
 
@@ -1489,6 +1493,97 @@ public class StateTransferTest extends AbstractViewTest {
                 assertThat(read2.getType()).isEqualTo(read3.getType());
                 assertThat(Arrays.equals(read1.getData(), read2.getData())).isTrue();
                 assertThat(Arrays.equals(read2.getData(), read3.getData())).isTrue();
+            }
+        }
+    }
+
+    /**
+     * Setup:
+     * Layout is A: [0, 100] A, B: [100, -1]. Trim mark: 101.
+     * Make sure that the merge of segments occurs (state transfer does not loop forever),
+     * and the final layout contains only one segment.
+     */
+    @Test
+    @SuppressWarnings("checkstyle:magicnumber")
+    public void restoreRedundancyTrimMarkIsMovedAfterSplit() throws Exception {
+        CorfuRuntime rt = null;
+
+        try (AutoClosableTempDirs dirs = new AutoClosableTempDirs(2)) {
+            List<File> tempDirs = dirs.getTempDirs();
+            ServerContext sc0 = new ServerContextBuilder()
+                    .setSingle(false)
+                    .setServerRouter(new TestServerRouter(SERVERS.PORT_0))
+                    .setPort(SERVERS.PORT_0)
+                    .setMemory(false)
+                    .setCacheSizeHeapRatio("0.0")
+                    .setLogPath(tempDirs.get(0).getAbsolutePath())
+                    .build();
+
+            ServerContext sc1 = new ServerContextBuilder()
+                    .setSingle(false)
+                    .setServerRouter(new TestServerRouter(SERVERS.PORT_1))
+                    .setPort(SERVERS.PORT_1)
+                    .setMemory(false)
+                    .setCacheSizeHeapRatio("0.0")
+                    .setLogPath(tempDirs.get(1).getAbsolutePath())
+                    .build();
+
+            // Add three servers
+            addServer(SERVERS.PORT_0, sc0);
+            addServer(SERVERS.PORT_1, sc1);
+
+            final long firstSegmentEnd = 100L;
+
+            Layout l1 = new TestLayoutBuilder()
+                    .setEpoch(1L)
+                    .addLayoutServer(SERVERS.PORT_0)
+                    .addLayoutServer(SERVERS.PORT_1)
+                    .addSequencer(SERVERS.PORT_0)
+                    .addSequencer(SERVERS.PORT_1)
+                    .buildSegment()
+                    .setStart(0L)
+                    .setEnd(firstSegmentEnd)
+                    .buildStripe()
+                    .addLogUnit(SERVERS.PORT_0)
+                    .addToSegment()
+                    .addToLayout()
+                    .buildSegment()
+                    .setStart(firstSegmentEnd)
+                    .setEnd(-1L)
+                    .buildStripe()
+                    .addLogUnit(SERVERS.PORT_0)
+                    .addLogUnit(SERVERS.PORT_1)
+                    .addToSegment()
+                    .addToLayout()
+                    .build();
+
+            bootstrapAllServers(l1);
+            rt = getRuntime(l1).connect();
+
+            final int tail = 150;
+
+            write(rt, tail, new HashSet<>(), new HashSet<>());
+
+            long logTail = rt.getAddressSpaceView().getLogTail();
+
+            assertThat(logTail).isEqualTo(tail - 1);
+
+            final long trimMark = 100;
+
+            rt.getAddressSpaceView().prefixTrim(Token.of(l1.epoch, trimMark));
+
+            long realTrimMark = rt.getAddressSpaceView().getTrimMark().getSequence();
+
+            assertThat(realTrimMark).isEqualTo(trimMark + 1L);
+
+            setAggressiveTimeouts(rt.getLayoutView().getLayout(), rt);
+
+            waitForLayoutChange(layout -> layout.segments.size() == 1,
+                    rt);
+        }
+        finally {
+            if (rt != null) {
+                rt.shutdown();
             }
         }
     }

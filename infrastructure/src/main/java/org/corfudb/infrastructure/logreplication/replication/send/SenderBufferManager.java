@@ -1,11 +1,17 @@
 package org.corfudb.infrastructure.logreplication.replication.send;
 
+import com.google.common.collect.ImmutableList;
+import com.google.protobuf.TextFormat;
+import io.micrometer.core.instrument.Tag;
+import io.micrometer.core.instrument.Timer;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import org.corfudb.common.metrics.micrometer.MeterRegistryProvider;
 import org.corfudb.infrastructure.logreplication.DataSender;
 import org.corfudb.infrastructure.logreplication.infrastructure.plugins.DefaultClusterConfig;
-import org.corfudb.protocols.wireprotocol.logreplication.LogReplicationEntry;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMetadataMsg;
+import org.corfudb.runtime.LogReplication.LogReplicationEntryMsg;
 import org.corfudb.runtime.view.Address;
 
 import java.io.File;
@@ -13,11 +19,17 @@ import java.io.FileReader;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicLong;
+
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.overrideMetadata;
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.overrideSyncSeqNum;
+import static org.corfudb.protocols.service.CorfuProtocolLogReplication.overrideTopologyConfigId;
 
 /**
  * Sender Buffer Manager to store outstanding message that hasn't got an ACK yet.
@@ -71,6 +83,8 @@ public abstract class SenderBufferManager {
 
     private long topologyConfigId;
 
+    private Optional<AtomicLong> ackCounter = Optional.empty();
+
     /*
      * The messages sent to the receiver that have not been ACKed yet.
      */
@@ -84,7 +98,7 @@ public abstract class SenderBufferManager {
      */
     @Getter
     @Setter
-    Map<Long, CompletableFuture<LogReplicationEntry>> pendingCompletableFutureForAcks;
+    Map<Long, CompletableFuture<LogReplicationEntryMsg>> pendingCompletableFutureForAcks;
 
     /**
      * Constructor
@@ -101,6 +115,11 @@ public abstract class SenderBufferManager {
         pendingMessages = new SenderPendingMessageQueue(maxBufferSize);
         pendingCompletableFutureForAcks = new HashMap<>();
         this.dataSender = dataSender;
+    }
+
+    public SenderBufferManager(DataSender dataSender, Optional<AtomicLong> counter) {
+        this(dataSender);
+        this.ackCounter = counter;
     }
 
     /**
@@ -137,17 +156,18 @@ public abstract class SenderBufferManager {
      * @throws ExecutionException
      * @throws TimeoutException
      */
-    public LogReplicationEntry processAcks() throws InterruptedException, ExecutionException, TimeoutException {
-        LogReplicationEntry ack = null;
+    public LogReplicationEntryMsg processAcks() throws InterruptedException, ExecutionException, TimeoutException {
+        LogReplicationEntryMsg ack = null;
 
         if (!pendingCompletableFutureForAcks.isEmpty()) {
-            ack = (LogReplicationEntry) CompletableFuture.anyOf(pendingCompletableFutureForAcks
+            ack = (LogReplicationEntryMsg) CompletableFuture.anyOf(pendingCompletableFutureForAcks
                     .values().toArray(new CompletableFuture<?>[pendingCompletableFutureForAcks.size()])).get(timeoutTimer, TimeUnit.MILLISECONDS);
 
             if (ack != null) {
                 updateAck(ack);
+                ackCounter.ifPresent(ac -> ac.addAndGet(pendingCompletableFutureForAcks.size()));
                 log.info("Received ack {} total pending log entry acks {} for timestamps {}",
-                        ack == null ? "null" : ack.getMetadata(),
+                        ack == null ? "null" : TextFormat.shortDebugString(ack.getMetadata()),
                         pendingCompletableFutureForAcks.size(), pendingCompletableFutureForAcks.keySet());
             }
         }
@@ -155,29 +175,52 @@ public abstract class SenderBufferManager {
         return ack;
     }
 
-    public CompletableFuture<LogReplicationEntry> sendWithBuffering(LogReplicationEntry message) {
-        message.getMetadata().setSnapshotSyncSeqNum(snapshotSyncSequenceNumber++);
-        pendingMessages.append(message);
-        CompletableFuture<LogReplicationEntry> cf = dataSender.send(message);
+    public CompletableFuture<LogReplicationEntryMsg> sendWithBuffering(LogReplicationEntryMsg message) {
+        LogReplicationEntryMetadataMsg metadata = overrideSyncSeqNum(
+                message.getMetadata(), snapshotSyncSequenceNumber++);
+        LogReplicationEntryMsg newMessage = overrideMetadata(message, metadata);
+        pendingMessages.append(newMessage);
+        CompletableFuture<LogReplicationEntryMsg> cf = dataSender.send(newMessage);
         addCFToAcked(message, cf);
         return cf;
     }
 
-    public void sendWithBuffering(List<LogReplicationEntry> dataToSend) {
+    public CompletableFuture<LogReplicationEntryMsg> sendWithBuffering(LogReplicationEntryMsg message,
+                                                                    String metricName,
+                                                                    Tag replicationTag) {
+        LogReplicationEntryMetadataMsg metadata = overrideSyncSeqNum(
+                message.getMetadata(), snapshotSyncSequenceNumber++);
+        LogReplicationEntryMsg newMessage = overrideMetadata(message, metadata);
+        Optional<Timer.Sample> sample = MeterRegistryProvider.getInstance().map(Timer::start);
+        CompletableFuture<LogReplicationEntryMsg> future = dataSender.send(newMessage);
+        CompletableFuture<LogReplicationEntryMsg> cf = sample
+                .map(s -> timeEntrySend(s, future, metricName, replicationTag))
+                .orElse(future);
+        addCFToAcked(newMessage, cf);
+        return cf;
+    }
+
+    public void sendWithBuffering(List<LogReplicationEntryMsg> dataToSend) {
         if (dataToSend.isEmpty()) {
             return;
         }
 
-        for (LogReplicationEntry message : dataToSend) {
-            sendWithBuffering(message);
+        dataToSend.forEach(this::sendWithBuffering);
+    }
+
+    public void sendWithBuffering(List<LogReplicationEntryMsg> dataToSend, String metricName, Tag replicationTag) {
+        if (dataToSend.isEmpty()) {
+            return;
         }
+
+        dataToSend.stream().forEach(entry -> sendWithBuffering(entry, metricName, replicationTag));
     }
 
     /**
      * Resend the messages in the queue if they have timed out.
      */
-    public LogReplicationEntry resend() {
-        LogReplicationEntry ack = null;
+    public LogReplicationEntryMsg resend() {
+        LogReplicationEntryMsg ack = null;
         boolean force = false;
         try {
             ack = processAcks();
@@ -197,16 +240,20 @@ public abstract class SenderBufferManager {
         }
 
         for (int i = 0; i < pendingMessages.getSize(); i++) {
-            LogReplicationPendingEntry entry  = pendingMessages.getList().get(i);
+            LogReplicationPendingEntry entry = pendingMessages.getPendingEntries().get(i);
             if (entry.timeout(msgTimer) || force) {
                 entry.retry();
                 // Update metadata as topologyConfigId could have changed in between resend cycles
-                LogReplicationEntry dataEntry = entry.getData();
-                dataEntry.getMetadata().setTopologyConfigId(topologyConfigId);
-                CompletableFuture<LogReplicationEntry> cf = dataSender.send(entry.getData());
+                LogReplicationEntryMsg dataEntry = entry.getData();
+                LogReplicationEntryMetadataMsg metadata = overrideTopologyConfigId(
+                        dataEntry.getMetadata(), topologyConfigId);
+                CompletableFuture<LogReplicationEntryMsg> cf = dataSender
+                        .send(overrideMetadata(entry.getData(), metadata));
                 addCFToAcked(entry.getData(), cf);
-                log.debug("Resend message {}[ts={}]", entry.getData().getMetadata().getMessageMetadataType(),
-                        entry.getData().getMetadata().getTimestamp());
+                log.debug("Resend message {}[ts={}, snapshotSyncNum={}]",
+                        entry.getData().getMetadata().getEntryType(),
+                        entry.getData().getMetadata().getTimestamp(),
+                        entry.getData().getMetadata().getSnapshotSyncSeqNum());
             }
         }
 
@@ -226,14 +273,14 @@ public abstract class SenderBufferManager {
         pendingCompletableFutureForAcks.clear();
     }
 
-    public abstract void addCFToAcked(LogReplicationEntry message, CompletableFuture<LogReplicationEntry> cf);
+    public abstract void addCFToAcked(LogReplicationEntryMsg message, CompletableFuture<LogReplicationEntryMsg> cf);
     /**
      * Update the last ackTimestamp and evict all entries whose timestamp is less or equal to the ackTimestamp
      * @param newAck
      */
     public abstract void updateAck(Long newAck);
 
-    public abstract void updateAck(LogReplicationEntry entry);
+    public abstract void updateAck(LogReplicationEntryMsg entry);
 
     public void onError(LogReplicationError error) {
         dataSender.onError(error);
@@ -241,5 +288,29 @@ public abstract class SenderBufferManager {
 
     public void updateTopologyConfigId(long topologyConfigId) {
         this.topologyConfigId = topologyConfigId;
+    }
+
+    private CompletableFuture<LogReplicationEntryMsg> timeEntrySend(Timer.Sample sample,
+                                                                CompletableFuture<LogReplicationEntryMsg> entryFuture,
+                                                                String metricName, Tag replicationTag) {
+        Tag successTag = Tag.of("status", "success");
+        Tag failedTag = Tag.of("status", "fail");
+        return MeterRegistryProvider
+                .getInstance()
+                .map(registry -> {
+                    CompletableFuture<LogReplicationEntryMsg> future = new CompletableFuture<>();
+                    entryFuture.whenComplete((entry, err) -> {
+                        if (entry != null) {
+                            sample.stop(registry.timer(metricName,
+                                    ImmutableList.of(replicationTag, successTag)));
+                            future.complete(entry);
+                        } else {
+                            sample.stop(registry.timer(metricName,
+                                    ImmutableList.of(replicationTag, failedTag)));
+                            future.completeExceptionally(err);
+                        }
+                    });
+                    return future;
+                }).orElse(entryFuture);
     }
 }
